@@ -1,0 +1,19 @@
+{
+    "MTDetails": {
+        "MTEmail": "YourEmail",
+        "MTPassword": "YourPassword",
+        "MTUrl": "https://meadtools.com/api"
+    },
+    "Sessions": [
+        {
+            "MTDeviceToken": "Your iSpindel Token From MeadTools",
+            "MTRecipeId": -1,
+            "BrewName": "What To Call Your Brew Session",
+            "Pill Name": "Yelow Top",
+            "Mac Address": "Pill Mac Address +2 on last digits (e.g. 14 -> 16)",
+            "Poll Interval": 120,
+            "Temp in C": true,
+            "Log To Database": true
+        }
+    ]
+}
