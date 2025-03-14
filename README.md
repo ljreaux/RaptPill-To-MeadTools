@@ -1,7 +1,14 @@
 # RaptPill To MeadTools
 Using a RAPT Pill tracker, collect the bluetooth data and log it to MeadTools.com
 
+# Requirements
+Python 3.9+
+Install requirements.txt (python -m pip install -r requirements.txt)
 
+# Steps To Use
+Make sure reqs are installed and then open the src/data.json in a text editor. 
+See below section about what to fill in 
+run it - python src/PillToMeadTools.py
 
 # data.json explanation
 
@@ -26,3 +33,4 @@ For each Rapt Pill:
 "Temp in C": true if you want temp in c else it will be in F
 
 "Log To Database": if true, log to MeadTools else just print in window/console
+
