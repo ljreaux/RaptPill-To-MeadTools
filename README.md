@@ -36,6 +36,10 @@ Poll interval is how long it will look for bluetooth data before stopping for an
 
 When filling in these text boxes, please make sure to hit Enter to save it, else it will only save when you start a session.
 
+# Steps To Use
+Make sure reqs are installed and then open the src/data.json in a text editor. 
+See below section about what to fill in 
+run it - python src/PillToMeadTools.py
 
 # data.json explanation
 With current version you shouldn't need to fill this in.
@@ -60,4 +64,6 @@ For each Rapt Pill:
 "Temp in C": true if you want temp in c else it will be in F
 
 "Log To Database": if true, log to MeadTools else just print in window/console
+
+
 
