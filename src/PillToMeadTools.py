@@ -13,6 +13,8 @@ import traceback
 import requests
 from pprint import pprint
 from signal import SIGINT, SIGTERM
+from time import time
+import threading
 
 # Taken from rapt_ble on github (https://github.com/sairon/rapt-ble/blob/main/src/rapt_ble/parser.py#L14) as well as the decode_rapt_data
 RAPTPillMetricsV1 = namedtuple("RAPTPillMetrics", "version, mac, temperature, gravity, x, y, z, battery")
@@ -21,28 +23,32 @@ RAPTPillMetricsV2 = namedtuple(
     "hasGravityVel, gravityVel, temperature, gravity, x, y, z, battery",
 )
 PILLS = []
+WINDOW = None
+
 
 class MeadTools(object):
-    def __init__(self, data: dict, data_path: Path, pill):
-        # filled in by querying MT for it
-        self.deviceid = None
+    def __init__(self, data: dict, data_path: Path, pill_holder: PillHolder):
+        # filled in by querying MT for it - this is the ispindel id not the hydrometer id
+        self.deviceid = data.get("MTDetails", {}).get("MTDeviceToken", None)
+        self.pill_holder = pill_holder
         # filled in by querying MT for it
         self.brewid = None
         self.brew_name = ""
-        self.pill = pill
         self.data_path = data_path
         self.data = data
         self.hydrometers = []
         self.brews = []
         self.logged_in = False
-        self.headers = {
-            "Authorization": f"Bearer {self.data['MTDetails'].get('AccessToken', None)}",
-        }
-
 
     @property
     def mt_data(self):
         return self.data.get("MTDetails", {})
+
+    @property
+    def headers(self):
+        return {
+            "Authorization": f"Bearer {self.data['MTDetails'].get('AccessToken', 'ACCESS TOKEN NOT SET')}",
+        }
 
     @property
     def __base_url__(self):
@@ -66,7 +72,16 @@ class MeadTools(object):
 
     @property
     def __reg_hydrom_url__(self):
-        return f"{self.__base_url__}/hydrometer/register"
+        return f"{self.__base_url__}/hydrometer/rapt-pill/register"
+
+    @property
+    def __token_url__(self):
+        """Url for generating a device token
+
+        Returns:
+            str: url to get a token
+        """
+        return f"{self.__base_url__}/hydrometer/token"
 
     @property
     def __brews_url__(self):
@@ -141,7 +156,7 @@ class MeadTools(object):
             return True
         else:
             print(f"Failed to Login! {response}")
-            print(f"Attempted with: URL:{self.__login_url__} body: {body}")
+            print(f"Attempted with: URL: {self.__login_url__} body: {body}")
             return False
 
     def get_hydrometers(self):
@@ -151,11 +166,33 @@ class MeadTools(object):
         if response.status_code == 200:
             print(f"Hydrometers: {response.json()}")
             self.hydrometers = response.json().get("devices")
+            self.pill_holder.update_status("Successfully got hydrometers from Mead Tools...")
             return True
         else:
 
             print(f"Failed to get hydrometers! {response}")
+            self.pill_holder.update_status(f"Failed to get hydrometers from Mead Tools... Error Code:{response}")
             print(f"Attempted with: URL:{self.__hyrdom_url__} and Auth headers")
+            return False
+
+    def register_hydrometer(self, hydrom_name: str):
+        """Register a hydrometer for the given device token
+
+        Args:
+            hydrom_name (str): name of the hydrometer
+
+        Returns:
+            str: hydrometer_token
+        """
+        body = {"token": self.deviceid, "name": hydrom_name}
+        print(f"Registering Hydrometer on MeadTools... Body: {body}  URL:{self.__reg_hydrom_url__}")
+        pprint(body, indent=4)
+        response = requests.post(self.__reg_hydrom_url__, json=body)
+        if response.status_code == 200:
+            print("Successfully logged data to MTools...")
+            return response.json().get("id", "No Id!")
+        else:
+            print(f"!!! Failed to register hydrometer! {response} !!!")
             return False
 
     def get_brews(self):
@@ -170,15 +207,15 @@ class MeadTools(object):
             print(f"Failed to get Brews! {response}")
             return False
 
-    def register_brew(self):
+    def register_brew(self, brew_name: str, hydrom_id: str):
         """Register the brew on MeadTools if it's not already registered
 
         Returns:
             bool: True if successful else False
         """
         body = {
-            "device_id": self.deviceid,
-            "brew_name": self.pill.session_data.get("BrewName"),
+            "device_id": hydrom_id,
+            "brew_name": brew_name,
         }
         print(f"Registering brews with MeadTools : {body}  URL:{self.__brews_url__}")
         response = requests.post(self.__brews_url__, headers=self.headers, json=body)
@@ -186,81 +223,51 @@ class MeadTools(object):
         if response.status_code == 200:
             print(f"brews: {response.json()}")
             self.brews = response.json()
-            if self.pill.session_data.get("MTReciedId", None):
-                self.brewid = response.json.get("id")
-            return True
+            return response.json()
+
         else:
             print(f"Failed to register brews! {response}")
-            raise RuntimeError(f"Couldn't register brew:{self.pill.session_data.get('BrewName')}! {response}")
+            raise RuntimeError(f"Couldn't register brew:{brew_name} -  {response}")
 
-    def initialize_brew(self):
+    def generate_device_token(self):
+        """Generate a new ispindel token - usually we don't want to do this too much - ideally we want the user to fill this
+        in the data/gui instead
+
+        Raises:
+            RuntimeError: couldn't get a new token
+
+        Returns:
+            str: generated token
         """
-        1. Attempt to post to /hydrometer - check if brew_id is set - if not we should have a device_id
-         1a. if we have device id but not brew_id - post to /hydrometer/brew with brew name and device_id
-        2. Post data blob to /hydrometer which should corrolate to a device and a brew on MT (it handles it)
+        print(f"Try to register deviceId... {self.__token_url__} : headers{self.headers}")
+        response = requests.post(self.__token_url__, headers=self.headers)
+        # this should respond with
         """
-        if self.pill.session_data.get("MTDeviceId", "") == "":
-            print(f"Try to register deviceId... {self.__reg_hydrom_url__}")
-            response = requests.post(self.__reg_hydrom_url__, headers=self.headers)
-            # this should respond with
-            """
-            "200": {
-                "token": "string - Hydrometer token"
-            },
-            """
-            if response.status_code == 200:
-                self.pill.session_data["MTDeviceId"] = response.json().get("token", "")
-            else:
-                print(f"Failed to register deviceid! {response}")
-                raise RuntimeError("Couldn't register Pill with MeadTools")
+        "200": {
+            "token": "string - Hydrometer token"
+        },
+        """
 
-        self.deviceid = self.pill.session_data.get("MTDeviceId", None)
-        if not self.deviceid:
-            raise ValueError(f"MTDeviceID not set for {self.pill.session_data.get('BrewName')}")
-
-        # try to get all brews
-        self.get_brews()
-
-        if not len(self.brews):
-            # if we have no brews registered, register our brew
-            self.register_brew()
+        if response.status_code == 200:
+            token = response.json().get("token", "")
+            self.deviceid = token
+            return token
         else:
-            # do some checking of the brews to see if we have one registered already that matches our details
-            print(f'Looking for brew: {self.pill.session_data.get("BrewName")} using deviceId:{self.deviceid}')
-            existing_brew = next(
-                (
-                    x
-                    for x in self.brews
-                    if (
-                        # Find a matching brew by name
-                        x.get("name", "") == self.pill.session_data.get("BrewName") 
-                        # Find a brew that is still ongoing
-                        and x.get("end_date", None) == None
-                    )
-                ),
-                None,
-            )
-            if not existing_brew:
-                print("Couldn't find matching brew name and device_id that is still ongoing... registering new brew!")
-                self.register_brew()
-            else:
-                print(f"Found existing brew with name: {self.pill.session_data.get('BrewName')} that is ongoing")
-                self.brewid = existing_brew.get("id")
+            print(f"Failed to register deviceid! {response}")
+            self.pill_holder.update_status(f"Couldn't register Pill with MeadTools: {response}")
+            raise RuntimeError(f"Couldn't register Pill with MeadTools: {response}")
 
-            if self.brewid and (self.data.get("MTRecipeId", "") != "" or self.data.get("MTRecipeId", "") != None):
-                self.link_brew_to_recipe()
-
-    def delete_brew(self, brew_data:dict):
+    def delete_brew(self, brew_data: dict):
 
         if not brew_data.get("end_date", None):
             print(f"Brew: {brew_data.get('name')} is not ended, can't delete!")
             return False
         brew_id = brew_data.get("id")
         print(f"Trying to delete brew: {self.__brews_url__}/{brew_id}")
-        
+
         response = requests.delete(f"{self.__brews_url__}/{brew_id}", headers=self.headers)
         print(response)
-        
+
         if response.status_code == 200:
             print("Deleted brew successfully!")
             return True
@@ -268,10 +275,10 @@ class MeadTools(object):
             print("Failed to delete brew!")
             return False
 
-    def link_brew_to_recipe(self):
-        body = {"recipe_id": self.pill.session_data.get("MTRecipeId")}
-        print(f'Trying to link brew: {body} - url: {self.__brews_url__}/{self.brewid}')
-        response = requests.patch(f"{self.__brews_url__}/{self.brewid}", headers=self.headers, json=body)
+    def link_brew_to_recipe(self, brewid, recipe_id: int):
+        body = {"recipe_id": int(recipe_id)}
+        print(f"Trying to link brew: {body} - url: {self.__brews_url__}/{self.brewid}")
+        response = requests.patch(f"{self.__brews_url__}/{brewid}", headers=self.headers, json=body)
         # this should respond with
         """
         "200": {
@@ -279,19 +286,19 @@ class MeadTools(object):
         },
         """
         if response.status_code == 200:
-            self.pill.session_data["MTDeviceId"] = response.json().get("MTDeviceId", "")
+            return response.json().get("MTDeviceId", "")
         else:
             print(f"Failed to link brew:{self.brewid} to recipe:{body.get('recipe_id')}")
-            raise RuntimeError("Couldn't register Pill with MeadTools")
-        
-    def end_brew(self):
-        if not self.deviceid or not self.brewid:
-            raise RuntimeError(f"Deviced Id: {self.deviceid}  OR BrewID: {self.brewid} Not set correctly, can't end the brew!")
+            raise RuntimeError(f"Failed to link brew:{self.brewid} to recipe:{body.get('recipe_id')} - {response}")
+
+    def end_brew(self, hyrdometer_token, brew_id):
+        if not hyrdometer_token or not brew_id:
+            raise RuntimeError(f"Deviced Id: {brew_id}  OR BrewID: {brew_id} Not set correctly, can't end the brew!")
         body = {
-            "device_id": self.deviceid,
-            "brew_id": self.brewid,
+            "device_id": hyrdometer_token,
+            "brew_id": brew_id,
         }
-        
+
         print(f"Trying to end brew with {body}")
         response = requests.patch(f"{self.__brews_url__}", headers=self.headers, json=body)
         # this should respond with
@@ -309,7 +316,7 @@ class MeadTools(object):
             print(f"Ended brew: {self.brew_name}")
         else:
             print(f"Failed to end brew -  {response}")
-                 
+
     def ingredients(self):
         """Get the list of ingredients from MeadTools"""
         body = {
@@ -323,8 +330,8 @@ class MeadTools(object):
 
     def add_data_point(self, pill: RaptPill):
         body = {
-            "token": pill.session_data.get("MTDeviceToken", None),
-            "name": pill.mac_address,
+            "token": self.deviceid,
+            "name": pill.session_data.get("Pill Name", pill.mac_address),
             "gravity": pill.curr_gravity,
             "temperature": pill.temperature,
             "temp_units": pill.temp_unit,
@@ -337,7 +344,7 @@ class MeadTools(object):
             print("Successfully logged data to MTools...")
             return True
         else:
-            print(f"Failed to log data to MeadTools! {response}")
+            print(f"!!! Failed to log data to MeadTools! {response} !!!")
             return False
 
 
@@ -353,8 +360,10 @@ class RaptPill(object):
         mt_device_id: str,
         mac_address: str,
         poll_interval: int,
+        pill_holder: PillHolder,
         log_to_db: bool = True,
         temp_as_celsius: bool = True,
+        mtools: MeadTools = None,
     ):
         """Create a Pill object to actively poll for data
 
@@ -365,10 +374,16 @@ class RaptPill(object):
             mead_tools(MeadTools): details for database to log data to - If None, no data is logged and is just printed to output.
             temp_as_celsius(bool): set False if you want temp as F instead
         """
+        # RAPT only lets you put 30 seconds as the lowest temp anyways
+        self.min_time = 5
+        self.last_time = time()
 
+        self.thread = None
+        self.running = False
+        self.pill_holder = pill_holder
         # how often should we actively poll for data. This should ideally be slightly longer
         # than the send rate of the PILL so we make sure we are looking while it will be sending
-        self.__polling_interval = poll_interval
+        self.__polling_interval = int(poll_interval)
         # macaddress of pill
         self.__mac_address = mac_address
         # session that will be logged with data
@@ -403,18 +418,29 @@ class RaptPill(object):
         self.session_data = session_data
         self.data_path = data_path
         self.__log_to_db = log_to_db
-        self.mtools = None
+        self.mtools = mtools
         if self.__log_to_db:
-            print("Making MeadTools")
-            self.mtools = MeadTools(self.mt_data, self.data_path, self)
             self.mtools.handle_login()
             if not self.mtools.logged_in:
-                print("Not Logged in will only print to output...")
+                self.pill_holder.update_status("Not Logged in will only print to output...")
                 self.__log_to_db = False
             else:
                 self.mtools.get_hydrometers()
-                # Handle making sure initial brew is setup
-                self.mtools.initialize_brew()
+                self.hydrometer = next(
+                    (
+                        x
+                        for x in self.mtools.hydrometers
+                        if x.get("device_name")
+                        == self.session_data.get("Pill Name", self.session_data.get("Mac Address", "Default Pill Name"))
+                    ),
+                    None,
+                )
+                if self.hydrometer is None:
+                    self.hydrometer_token = self.mtools.register_hydrometer(self.session_data.get("Pill Name"))
+
+                else:
+                    self.hydrometer_token = self.hydrometer.get("id", "No Hydrom ID!")
+                self.initialise_brew()
 
         # polling variables
         self.__polling_task = None
@@ -498,26 +524,93 @@ class RaptPill(object):
     def mac_address(self):
         return self.__mac_address
 
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self.start_session, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        self.thread.join()
+
     def start_session(self):
         print(f"Starting Session: {self.session_name}")
-        self.bt_scanner = BleakScanner(detection_callback=self.device_found)
-        if self.__polling_task is None:
-            self.__polling_task = asyncio.create_task(self.__poll_for_device())
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def scan():
+
+            # self.bt_scanner = BleakScanner(detection_callback=self.device_found)
+            while self.running:
+                # print("Starting BLE scan...")  # ✅ This should print
+                async with BleakScanner(self.device_found) as scanner:
+                    await asyncio.sleep(self.poll_interval)
+                # print("Scan complete. Waiting for next cycle...")
+                await asyncio.sleep(10)
+
+        loop.run_until_complete(scan())
 
     def end_session(self):
-        if self.__polling_task is not None:
-            self.__polling_task.cancel()
-            self.__polling_task = None
-            self.active_pollers.remove(self)
-            self.mtools.end_brew()
-            print(f"Ended Session: {self.session_name}")
+        print(f"Stopping thread: {self.session_name}")
+        self.running = False
+        self.thread = None
 
-    async def __poll_for_device(self):
-        """poll for data from the Pill"""
-        while True:
-            await self.bt_scanner.start()
-            await asyncio.sleep(self.__polling_interval)
-            await self.bt_scanner.stop()
+        # if self.__polling_task is not None:
+        #     self.__polling_task.cancel()
+        #     self.__polling_task = None
+        #     self.active_pollers.remove(self)
+        #     self.mtools.end_brew()
+        print(f"Ended Session: {self.session_name}")
+
+    def initialise_brew(self):
+        """
+        1. Attempt to post to /hydrometer - check if brew_id is set - if not we should have a device_id
+         1a. if we have device id but not brew_id - post to /hydrometer/brew with brew name and device_id
+        2. Post data blob to /hydrometer which should corrolate to a device and a brew on MT (it handles it)
+        """
+        device_token = None
+
+        if self.mtools.deviceid == None:
+            self.mtools.deviceid = self.mtools.generate_device_token()
+            self.mtools.save_data()
+
+        if not self.mtools.deviceid:
+            raise ValueError(f"MTDeviceID not set for {self.session_data.get('BrewName')}")
+
+        # try to get all brews
+        self.mtools.get_brews()
+
+        if not len(self.mtools.brews):
+            # if we have no brews registered, register our brew
+            self.mtools.register_brew(self.session_name, self.hydrometer_token)
+        else:
+            # do some checking of the brews to see if we have one registered already that matches our details
+            print(f'Looking for brew: {self.session_data.get("BrewName")}')
+            existing_brew = next(
+                (
+                    x
+                    for x in self.mtools.brews
+                    if (
+                        # Find a matching brew by name
+                        x.get("name", "") == self.session_data.get("BrewName")
+                        # Find a brew that is still ongoing
+                        and x.get("end_date", None) == None
+                    )
+                ),
+                None,
+            )
+            if not existing_brew:
+                print("Couldn't find matching brew name and device_id that is still ongoing... registering new brew!")
+                existing_brew = self.mtools.register_brew(self.session_name, self.hydrometer_token)
+                self.brewid = existing_brew[0].get("id")
+            else:
+                print(f"Found existing brew with name: {self.session_data.get('BrewName')} that is ongoing")
+                self.brewid = existing_brew.get("id")
+
+        if self.brewid and (
+            self.session_data.get("MTRecipeId", "") != "" or self.session_data.get("MTRecipeId", "") != None
+        ):
+            self.mtools.link_brew_to_recipe(self.brewid, self.session_data.get("MTRecipeId", ""))
 
     def device_found(self, device: BLEDevice, advertisement_data: AdvertisementData):
         """This is fired everytime the bleakScanner finds a bluetooth device so we check if it is the macaddress of the pill we are tracking
@@ -588,7 +681,6 @@ class RaptPill(object):
         if version == 1:
             metrics_raw = RAPTPillMetricsV1._make(unpack(">B6sHfhhhh", data[2:]))
         else:
-            # metrics_raw = RAPTPillMetricsV2._make( unpack(">BfHfhhhH", data[4:]))
             metrics_raw = RAPTPillMetricsV2._make(unpack(">BfHfhhhH", data[4:]))
 
         now = datetime.now(timezone.utc)
@@ -608,9 +700,23 @@ class RaptPill(object):
         self.__z = metrics_raw.z / 16
 
         if self.__log_to_db:
-            self.mtools.add_data_point(self)
+            curr_time = time()
+            time_since = curr_time - self.last_time
+            if time_since >= self.min_time:
+                self.last_time = curr_time
+
+                self.mtools.add_data_point(self)
+                self.pill_holder.update_status(
+                    f"Logged Data to MeadTools for: {self.session_name} - SG:{self.curr_gravity} , Temp: {self.temperature} , ~ABV:{self.abv}"
+                )
         else:
-            print(self)
+            curr_time = time()
+            time_since = curr_time - self.last_time
+            if time_since >= self.min_time:
+                self.last_time = curr_time
+
+                print(self)
+                print("Logging to console only")
 
     def __repr__(self):
         return (
@@ -641,47 +747,117 @@ class RaptPill(object):
         )
 
 
-async def main() -> None:
-    # Handle setup of database and pill(s)
-    data_path = Path(__file__).parent.joinpath("data.json")
-    global PILLS
-    try:
+class PillHolder(object):
+    def __init__(self):
+        self.curr_dir = Path(__file__).parent
+        self.data_path = self.curr_dir.joinpath("data.json")
+        self.pills = []
+        self.ui = None
+
         # if data is filled in data.json file use it and start sessions and database (if set)
-        if data_path.exists():
-            # Read data.json and spin up processes
-            data = json.loads(data_path.read_text())
+        if not self.data_path.exists():
+            raise RuntimeError("data.json file is missing, can't start!")
 
-            for pill_details in data.get("Sessions", []):
-                # MAC addresses of your RAPT Pill(s) - in case you have more (This hasn't been actually tested but it should in theory work.)
-                pill = RaptPill(
-                    data,
-                    pill_details,
-                    data_path,
-                    pill_details.get("BrewName", "NoSessionNameSet"),
-                    pill_details.get("MTDeviceToken", "NO DEVICE ID"),
-                    pill_details.get("Mac Address", "No Mac Address Set!"),
-                    pill_details.get("Poll Interval", ""),
-                    temp_as_celsius=pill_details.get("Temp in C", True),
-                )
-                PILLS.append(pill)
-                if pill.mtools.logged_in:
-                    pill.start_session()
-                else:
-                    print(f"Not logged in to MeadTools - can't start Brew: {pill.session_name}")
+        # Read data.json and spin up processes
+        self.data = json.loads(self.data_path.read_text())
+        self.mtools = MeadTools(self.data, self.data_path, self)
+        if not self.data.get("Sessions", []):
+            self.data["Sessions"] = []
+        self.mtools.save_data()
+
+        if self.data.get("UseGui", True):
+            global WINDOW
+            import PillGui
+
+            PillGui.setup_ui(self)
+            WINDOW = PillGui.WINDOW
+            self.ui = WINDOW
+            if WINDOW:
+
+                WINDOW.qapp.exec()
+
+            else:
+                raise RuntimeError("data.json not found! - refer to github depot on how to get/setup data.json")
         else:
-            raise RuntimeError("data.json not found! - refer to github depot on how to get/setup data.json")
+            raise RuntimeError("Can't currently run without gui!")
 
-    except KeyboardInterrupt:
-        print("Got Keyboard interrupt, ending sessions")
-        for pill in PILLS:
+    def run_pills(self):
+        print("Starting Pill Sessions...")
+        for pill_details in self.data.get("Sessions", []):
+            # MAC addresses of your RAPT Pill(s) - in case you have more (This hasn't been actually tested but it should in theory work.)
+            print(pill_details)
+
+            pill = RaptPill(
+                self.data,
+                pill_details,
+                self.data_path,
+                pill_details.get("BrewName", "NoSessionNameSet"),
+                self.data.get("MTDetails", {}).get("MTDeviceToken", "NO DEVICE ID"),
+                pill_details.get("Mac Address", "No Mac Address Set!"),
+                pill_details.get("Poll Interval", ""),
+                pill_holder=self,
+                temp_as_celsius=pill_details.get("Temp in C", True),
+                mtools=self.mtools,
+            )
+            self.pills.append(pill)
+            if pill.mtools.logged_in:
+                print("Should start pill session!")
+                pill.start()
+
+            else:
+                self.update_status(f"Not logged in to MeadTools - can't start Brew: {pill.session_name}")
+
+    def run_pill(self, pill_details: dict):
+        print(f"Running single pill: {pill_details.get('Session Name')}")
+        pill = RaptPill(
+            self.data,
+            pill_details,
+            self.data_path,
+            pill_details.get("BrewName", "NoSessionNameSet"),
+            self.data.get("MTDetails", {}).get("MTDeviceToken", "NO DEVICE ID"),
+            pill_details.get("Mac Address", "No Mac Address Set!"),
+            pill_details.get("Poll Interval", ""),
+            pill_holder=self,
+            temp_as_celsius=pill_details.get("Temp in C", True),
+            mtools=self.mtools,
+        )
+        self.pills.append(pill)
+        if pill.mtools.logged_in:
+            print("Should start pill session!")
+            pill.start()
+
+        else:
+            self.update_status(f"Not logged in to MeadTools - can't start Brew: {pill.session_name}")
+
+    def stop_pill(self, pill_details: dict):
+        """Stop the pill monitoring if we can find a matching pill
+
+        Args:
+            pill_details (dict): dict of pill details
+        """
+        pill = next((x for x in self.pills if x.session_name == pill_details.get("BrewName")), None)
+        if pill:
             pill.end_session()
+            self.pills.remove(pill)
+        else:
+            self.update_status(f"Couldn't find matching pill data for: {pill.data.get('BrewName')}")
+
+    def update_status(self, message: str):
+        """update the status bar in the gui
+
+        Args:
+            message (str): message to show
+        """
+        if not self.ui:
+            print(message)
+            return
+        self.ui.update_status(message)
+
+
+def main() -> None:
+    # Handle setup of database and pill(s)
+    pillHolder = PillHolder()
+
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.create_task(main())
-    try:
-        loop.run_forever()
-    except KeyboardInterrupt:
-        for pill in PILLS:
-            pill.end_session()
+    main()
