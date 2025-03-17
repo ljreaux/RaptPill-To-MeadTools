@@ -61,8 +61,8 @@ jobs:
       - name: Build macOS App Bundle
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --onedir \
-            --name "meadtools-pill-macOS" \
+          pyinstaller --windowed --onedir \
+            --name "MeadToolsPill" \
             --icon=src/icons/meadtools-pill.icns \
             --add-data "src/icons:icons" \
             --add-data "src/data.json:." \
@@ -77,8 +77,11 @@ jobs:
             --hidden-import=CoreBluetooth \
             src/PillToMeadTools.py
 
-            # Show the build output for debugging
-            ls -lh dist/
+          # Check if the .app was created
+          ls -lh dist/
+
+          # Zip the app bundle to preserve structure
+          cd dist && zip -r MeadToolsPill-macOS.zip MeadToolsPill.app
         shell: bash
 
       # Linux Build
@@ -113,7 +116,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-app
-          path: dist/meadtools-pill-macOS
+          path: dist/MeadToolsPill-macOS.zip
           if-no-files-found: error
 
       - name: Upload Linux Artifact
@@ -154,8 +157,6 @@ jobs:
 
           mv release-files/meadtools-pill.exe release-files/MeadToolsPill-Windows.exe || true
           mv release-files/meadtools-pill-linux release-files/MeadToolsPill-Linux || true
-          mv release-files/meadtools-pill-macOS release-files/MeadToolsPill-macOS || true
-
 
           # Verify final files
           echo "Final release files:"
