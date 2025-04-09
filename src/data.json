@@ -1,11 +1,7 @@
 {
-    "UseGui": true,
-    "MTDetails": {
-        "MTUrl": "https://meadtools.com/api",
-        "MTEmail": "admin@meadtools.com",
-        "MTPassword": "Augu$t20!5",
-        "RefreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiaWF0IjoxNzQyMjcyNTIxLCJleHAiOjE3NDM0ODIxMjF9.6V1zTYa168zov5AlKy7O2uEYAHmoNOBB8otJtfrQQuU",
-        "AccessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MSwiaWF0IjoxNzQyMjcyNTIxLCJleHAiOjE3NDI4NzczMjF9.7mjJCFbwx8AdEI13aRKsu1dgv0z3LdfMMhsJSU7AiJY"
-    },
-    "Sessions": []
+  "UseGui": true,
+  "MTDetails": {
+    "MTUrl": "https://meadtools.com/api"
+  },
+  "Sessions": []
 }
