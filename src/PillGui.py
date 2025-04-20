@@ -39,18 +39,35 @@ class PillWindow(QtWidgets.QMainWindow):
 
         # layouts
         self.hlay_MTLogin = QtWidgets.QHBoxLayout()
+        self.hlay_auth = QtWidgets.QHBoxLayout()
 
         # MTLogin
         self.cframe_mtools = CollapsibleFrame("MeadTools Login Details", "vertical", True, self)
+        self.rbtngrp = QtWidgets.QButtonGroup()
+        self.rbtn_mtUser = QtWidgets.QRadioButton("MeadTools User")
+        self.rbtn_google = QtWidgets.QRadioButton("Google Auth")
+        self.rbtngrp.addButton(self.rbtn_mtUser)
+        self.rbtngrp.setId(self.rbtn_mtUser, 0)
+        self.rbtngrp.addButton(self.rbtn_google)
+        self.rbtngrp.setId(self.rbtn_google, 1)
+        self.rbtn_mtUser.setChecked(True)
+
+        self.lablineE_googleAuth = LabeledLineEdit("Google Email:", "", False, self)
+        self.lablineE_googleAuth.setVisible(False)
         self.lablineE_username = LabeledLineEdit("Mead Tools Email:", "", False, self)
         self.lablineE_password = LabeledLineEdit("Mead Tools Password:", "", False, self)
         self.lablineE_password.lineEdit.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
 
         self.pbtn_login = QtWidgets.QPushButton("Login")
 
+        self.hlay_auth.addWidget(self.rbtn_mtUser)
+        self.hlay_auth.addWidget(self.rbtn_google)
+
         self.hlay_MTLogin.addWidget(self.lablineE_username)
         self.hlay_MTLogin.addWidget(self.lablineE_password)
         self.hlay_MTLogin.addWidget(self.pbtn_login)
+        self.cframe_mtools.add_layout(self.hlay_auth)
+        self.cframe_mtools.add_widget(self.lablineE_googleAuth)
         self.cframe_mtools.add_layout(self.hlay_MTLogin)
 
         self.pbtn_addBrew = QtWidgets.QPushButton("Add new Brew")
@@ -98,10 +115,36 @@ class PillWindow(QtWidgets.QMainWindow):
                 self.pill_widgets.append(widget)
                 self.sArea_pills.widget().layout().addWidget(frame_holder)
 
+        self.lablineE_googleAuth.set_text(self.mdata.get("Google", ""))
+
+        if auth := self.settings.value("auth_type"):
+            if auth == 0:
+                self.rbtn_mtUser.setChecked(True)
+                self.lablineE_googleAuth.setVisible(False)
+                self.lablineE_username.setVisible(True)
+                self.lablineE_password.setVisible(True)
+            else:
+                self.rbtn_google.setChecked(True)
+                self.lablineE_googleAuth.setVisible(True)
+                self.lablineE_username.setVisible(False)
+                self.lablineE_password.setVisible(False)
+                self.lablineE_googleAuth.set_text(self.mdata.get("Google", ""))
+
     def connect_ui(self):
         self.pbtn_login.clicked.connect(self.login_to_meadtools)
         self.pbtn_addBrew.clicked.connect(self.add_brew)
         self.pbtn_startBrews.clicked.connect(self.start_brews)
+        self.rbtngrp.buttonClicked.connect(self.update_auth_input)
+
+    def update_auth_input(self, button):
+        if button.text() == "MeadTools User":
+            self.lablineE_googleAuth.setVisible(False)
+            self.lablineE_username.setVisible(True)
+            self.lablineE_password.setVisible(True)
+        else:
+            self.lablineE_googleAuth.setVisible(True)
+            self.lablineE_username.setVisible(False)
+            self.lablineE_password.setVisible(False)
 
     def add_brew(self):
         frame_holder = CollapsibleFrame("BrewName", start_opened=True, parent=self)
@@ -121,14 +164,35 @@ class PillWindow(QtWidgets.QMainWindow):
 
     def login_to_meadtools(self):
         """attempt to login to meadtools"""
-        self.tool.data["MTDetails"]["MTEmail"] = self.lablineE_username.text
-        self.tool.data["MTDetails"]["MTPassword"] = self.lablineE_password.text
-        self.tool.mtools.save_data()
-        success = self.tool.mtools.login()
-        if success:
-            self.update_status("Successfully Logged into Mead Tools")
+        if self.rbtngrp.checkedId() == 0:
+            self.tool.data["MTDetails"]["MTEmail"] = self.lablineE_username.text
+            self.tool.data["MTDetails"]["MTPassword"] = self.lablineE_password.text
+            self.tool.mtools.save_data()
+            success = self.tool.mtools.login()
+            if success:
+                self.update_status("Successfully Logged into Mead Tools")
+                self.mdata["LoginType"] = "MeadTools"
+            else:
+                self.update_status("Failed to Login to Mead Tools")
+                self.mdata["LoginType"] = "None"
         else:
-            self.update_status("Failed to Login to Mead Tools")
+            result = self.yes_no_messagebox(
+                "Would you like to continue?",
+                "This will try to authenticate with Google to login to Mead Tools.<br><br>"
+                "This may open a browser for you to complete the login (if you haven't done it before).<br><br>Are you sure you want to continue?",
+            )
+            if not result:
+                return
+            self.tool.data["MTDetails"]["Google"] = self.lablineE_googleAuth.text
+            self.tool.mtools.save_data()
+            success = self.tool.mtools.google_auth()
+            if success:
+                self.update_status("Successfully Logged into Mead Tools with Google...")
+                self.mdata["LoginType"] = "Google"
+
+            else:
+                self.mdata["LoginType"] = "None"
+                self.update_status("Failed to Login to Mead Tools via Google...")
 
     def update_status(self, message: str):
         """set a message in the statusbar and disappear after 5 seconds
@@ -144,12 +208,37 @@ class PillWindow(QtWidgets.QMainWindow):
         if self.settings:
             geo = self.saveGeometry()
             self.settings.setValue("geometry", geo)
+            self.settings.setValue("auth_type", self.rbtngrp.checkedId())
 
-        # end all sessions
-        # for pill in self.tool.pills:
-        #     pill.end_session()
-        # if self.event_loop:
-        #     self.event_loop.stop
+    def yes_no_messagebox(self, title: str, msg: str, icon_name: str = "NoIcon"):
+        """Create yes/no message box with given title and message
+
+        Args:
+            title (str): title of msgbox
+            msg (str): message to display to user
+            icon_name (str, optional): icon type for window. Defaults to "NoIcon". - Information, Warning, Error, Critical, NoIcon
+        """
+        msg_box = QtWidgets.QMessageBox(self)
+        if icon_name == "Information":
+            msg_box.setIcon(QtWidgets.QMessageBox.Information)
+        elif icon_name == "Warning":
+            msg_box.setIcon(QtWidgets.QMessageBox.Warning)
+        elif icon_name == "Error":
+            msg_box.setIcon(QtWidgets.QMessageBox.Error)
+        elif icon_name == "Critical":
+            msg_box.setIcon(QtWidgets.QMessageBox.Critical)
+        elif icon_name == "NoIcon":
+            msg_box.setIcon(QtWidgets.QMessageBox.NoIcon)
+
+        msg_box.setText(msg)
+        msg_box.setWindowTitle(title)
+        msg_box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
+        return_value = msg_box.exec()
+        if return_value == QtWidgets.QMessageBox.Yes:
+            return True
+        elif return_value == QtWidgets.QMessageBox.No:
+            return False
+        return None
 
 
 class LabeledLineEdit(QtWidgets.QWidget):
@@ -256,6 +345,7 @@ class PillWidget(QtWidgets.QWidget):
         self.save_data()
 
     def start_session(self):
+        """Start the session(s)"""
         self.running = not self.running
         if self.running:
             self.pbtn_start_session.setText("Stop Session")

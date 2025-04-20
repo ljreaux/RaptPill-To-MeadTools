@@ -5,16 +5,15 @@ from bleak.backends.scanner import AdvertisementData
 import asyncio
 from pathlib import Path
 import json
-from typing import Optional
 from struct import unpack
 from collections import namedtuple
 from datetime import datetime, timezone
 import traceback
 import requests
 from pprint import pprint
-from signal import SIGINT, SIGTERM
 from time import time
 import threading
+import g_auth
 
 # Taken from rapt_ble on github (https://github.com/sairon/rapt-ble/blob/main/src/rapt_ble/parser.py#L14) as well as the decode_rapt_data
 RAPTPillMetricsV1 = namedtuple("RAPTPillMetrics", "version, mac, temperature, gravity, x, y, z, battery")
@@ -28,11 +27,12 @@ WINDOW = None
 
 class MeadTools(object):
     def __init__(self, data: dict, data_path: Path, pill_holder: PillHolder):
+        self.__token__ = None
         # filled in by querying MT for it - this is the ispindel id not the hydrometer id
+        self.brewid = None
         self.deviceid = data.get("MTDetails", {}).get("MTDeviceToken", None)
         self.pill_holder = pill_holder
         # filled in by querying MT for it
-        self.brewid = None
         self.brew_name = ""
         self.data_path = data_path
         self.data = data
@@ -47,8 +47,13 @@ class MeadTools(object):
     @property
     def headers(self):
         return {
-            "Authorization": f"Bearer {self.data['MTDetails'].get('AccessToken', 'ACCESS TOKEN NOT SET')}",
+            # "Authorization": f"Bearer {self.data['MTDetails'].get('AccessToken', 'ACCESS TOKEN NOT SET')}",
+            "Authorization": f"Bearer {self.token}",
         }
+
+    @property
+    def token(self):
+        return self.__token__
 
     @property
     def __base_url__(self):
@@ -151,6 +156,7 @@ class MeadTools(object):
         if response.status_code == 200:
             self.mt_data["RefreshToken"] = response.json().get("refreshToken")
             self.mt_data["AccessToken"] = response.json().get("accessToken")
+            self.__token__ = response.json().get("accessToken")
             self.save_data()
             print("Logged into MeadTools")
             return True
@@ -158,6 +164,17 @@ class MeadTools(object):
             print(f"Failed to Login! {response}")
             print(f"Attempted with: URL: {self.__login_url__} body: {body}")
             return False
+
+    def google_auth(self):
+        """Run google authentication
+
+        Returns:
+            bool: whether it successfully logged in or not
+        """
+        result, token = g_auth.main()
+        if result:
+            self.__token__ = token
+        return result
 
     def get_hydrometers(self):
         print(f"Getting Hydrometers from MeadTools: {self.headers} - {self.__hyrdom_url__}")
@@ -227,7 +244,7 @@ class MeadTools(object):
 
         else:
             print(f"Failed to register brews! {response}")
-            raise RuntimeError(f"Couldn't register brew:{brew_name} -  {response}")
+            raise RuntimeError(f"Couldn't register brew:{brew_name} -  {response} : headers:{self.headers}")
 
     def generate_device_token(self):
         """Generate a new ispindel token - usually we don't want to do this too much - ideally we want the user to fill this
@@ -276,6 +293,9 @@ class MeadTools(object):
             return False
 
     def link_brew_to_recipe(self, brewid, recipe_id: int):
+        if recipe_id == -1:
+            print("No brewId set (-1) - not linking...")
+            return
         body = {"recipe_id": int(recipe_id)}
         print(f"Trying to link brew: {body} - url: {self.__brews_url__}/{self.brewid}")
         response = requests.patch(f"{self.__brews_url__}/{brewid}", headers=self.headers, json=body)
@@ -523,6 +543,14 @@ class RaptPill(object):
     @property
     def mac_address(self):
         return self.__mac_address
+
+    @property
+    def brewid(self):
+        return self.mtools.brewid
+
+    @brewid.setter
+    def brewid(self, id: str):
+        self.mtools.brewid = id
 
     def start(self):
         self.running = True
