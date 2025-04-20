@@ -1,7 +1,7 @@
 {
-    "UseGui": true,
-    "MTDetails": {
-        "MTUrl": "https://meadtools.com/api"
-    },
-    "Sessions": []
+  "UseGui": true,
+  "MTDetails": {
+    "MTUrl": "https://meadtools.com/api"
+  },
+  "Sessions": []
 }
