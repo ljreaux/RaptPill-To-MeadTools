@@ -7,11 +7,9 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
-from config import (
-    GOOGLE_CLIENT_ID,
-    GOOGLE_CLIENT_SECRET,
-    NEXTJS_API_URL,
-)
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+NEXTJS_API_URL = os.environ.get("NEXTJS_API_URL")
 
 # Determine the base path whether running as script or bundled with PyInstaller
 if getattr(sys, "frozen", False):
@@ -51,7 +49,11 @@ class GoogleAuthenticator:
                 self.credentials = Credentials.from_authorized_user_info(token_data)
 
                 # Refresh if expired
-                if self.credentials and self.credentials.expired and self.credentials.refresh_token:
+                if (
+                    self.credentials
+                    and self.credentials.expired
+                    and self.credentials.refresh_token
+                ):
                     self.credentials.refresh(Request())
                     self.save_credentials()  # Save refreshed tokens
                 return True
@@ -69,7 +71,9 @@ class GoogleAuthenticator:
                 "scopes": self.credentials.scopes,
                 "expiry": self.credentials.expiry.isoformat(),
             }
-            self.token_file.write_text(json.dumps(token_data, indent=4, separators=(",", ": ")))
+            self.token_file.write_text(
+                json.dumps(token_data, indent=4, separators=(",", ": "))
+            )
 
     def authenticate(self):
         """Authenticate user with Google OAuth"""
@@ -150,7 +154,9 @@ class GoogleAuthenticator:
                 result = response.json()
                 return result
             else:
-                print(f"Error verifying with Next.js: {response.status_code} - {response.text}")
+                print(
+                    f"Error verifying with Next.js: {response.status_code} - {response.text}"
+                )
                 return None
         except Exception as e:
             print(f"Error communicating with Next.js: {e}")
@@ -201,7 +207,9 @@ def main():
                 next_auth = auth.verify_with_nextjs()
                 if next_auth:
                     print("Verified with Next.js backend")
-                    print(f"User role: {next_auth.get('user', {}).get('role', 'unknown')}")
+                    print(
+                        f"User role: {next_auth.get('user', {}).get('role', 'unknown')}"
+                    )
                     print(f"Next.js token: {next_auth.get('token')}")
                     return True, next_auth.get("token")
                 else:

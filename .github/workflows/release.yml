@@ -6,11 +6,15 @@ on:
       - "v*" # Trigger only on version tags like v1.0, v0.2, etc.
 
 permissions:
-  contents: write # Required for creating a GitHub release
+  contents: write
 
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    env:
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      NEXTJS_API_URL: ${{ secrets.NEXTJS_API_URL }}
 
     strategy:
       matrix:
@@ -31,13 +35,6 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
           if [[ "$RUNNER_OS" == "Windows" ]]; then pip install bleak-winrt; fi
-        shell: bash
-
-      - name: Inject secure config
-        run: |
-          echo "GOOGLE_CLIENT_ID = '${{ secrets.GOOGLE_CLIENT_ID }}'" >> config.py
-          echo "GOOGLE_CLIENT_SECRET = '${{ secrets.GOOGLE_CLIENT_SECRET }}'" >> config.py
-          echo "NEXTJS_API_URL = '${{ secrets.NEXTJS_API_URL }}'" >> config.py
         shell: bash
 
       - name: Install Linux dependencies for PySide6
