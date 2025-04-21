@@ -30,19 +30,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-
-      # Install Linux dependencies for PySide6
-      - name: Install Linux dependencies for PySide6
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxcb-xinerama0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xkb1 libxkbcommon-dev libxcb-shape0 libxcb-xinerama0-dev
+          if [[ "$RUNNER_OS" == "Windows" ]]; then pip install bleak-winrt; fi
+        shell: bash
 
       - name: Inject secure config
         run: |
           echo "GOOGLE_CLIENT_ID = '${{ secrets.GOOGLE_CLIENT_ID }}'" >> config.py
           echo "GOOGLE_CLIENT_SECRET = '${{ secrets.GOOGLE_CLIENT_SECRET }}'" >> config.py
           echo "NEXTJS_API_URL = '${{ secrets.NEXTJS_API_URL }}'" >> config.py
+        shell: bash
+
+      - name: Install Linux dependencies for PySide6
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb-xinerama0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-xkb1 libxkbcommon-dev libxcb-shape0 libxcb-xinerama0-dev
 
       # Windows Build
       - name: Build Windows Executable
@@ -62,12 +64,6 @@ jobs:
             --hidden-import=bleak.backends.winrt ^
             src\PillToMeadTools.py
         shell: cmd
-
-      - name: Inject secure config
-        run: |
-          echo "GOOGLE_CLIENT_ID = '${{ secrets.GOOGLE_CLIENT_ID }}'" >> config.py
-          echo "GOOGLE_CLIENT_SECRET = '${{ secrets.GOOGLE_CLIENT_SECRET }}'" >> config.py
-          echo "NEXTJS_API_URL = '${{ secrets.NEXTJS_API_URL }}'" >> config.py
 
       # macOS Build
       - name: Build macOS App Bundle
@@ -89,38 +85,29 @@ jobs:
             --hidden-import=CoreBluetooth \
             src/PillToMeadTools.py
 
-          # Check if the .app was created
           ls -lh dist/
-
-          # Zip the app bundle to preserve structure
           cd dist && zip -r MeadToolsPill-macOS.zip MeadToolsPill.app
         shell: bash
-
-      - name: Inject secure config
-        run: |
-          echo "GOOGLE_CLIENT_ID = '${{ secrets.GOOGLE_CLIENT_ID }}'" >> config.py
-          echo "GOOGLE_CLIENT_SECRET = '${{ secrets.GOOGLE_CLIENT_SECRET }}'" >> config.py
-          echo "NEXTJS_API_URL = '${{ secrets.NEXTJS_API_URL }}'" >> config.py
 
       # Linux Build
       - name: Build Linux Executable
         if: runner.os == 'Linux'
         run: |
           pyinstaller --onefile --windowed \
-             --name meadtools-pill-linux \
-             --icon=src/icons/meadtools-pill.png \
-             --add-data "src/icons:icons" \
-             --add-data "src/data.json:." \
-             --hidden-import=PySide6.QtCore \
-             --hidden-import=PySide6.QtGui \
-             --hidden-import=PySide6.QtWidgets \
-             --hidden-import=requests \
-             --hidden-import=bleak \
-             --hidden-import=bleak.backends.bluezdbus \
-             src/PillToMeadTools.py
+            --name meadtools-pill-linux \
+            --icon=src/icons/meadtools-pill.png \
+            --add-data "src/icons:icons" \
+            --add-data "src/data.json:." \
+            --hidden-import=PySide6.QtCore \
+            --hidden-import=PySide6.QtGui \
+            --hidden-import=PySide6.QtWidgets \
+            --hidden-import=requests \
+            --hidden-import=bleak \
+            --hidden-import=bleak.backends.bluezdbus \
+            src/PillToMeadTools.py
         shell: bash
 
-      # Upload artifacts based on OS
+      # Upload artifacts
       - name: Upload Windows Artifact
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
@@ -168,15 +155,14 @@ jobs:
           name: linux-executable
           path: release-files
 
+      - name: Make Linux Executable
+        run: chmod +x release-files/meadtools-pill-linux || true
+
       - name: Rename Files for Clarity
         run: |
-          # Display files before renaming
           ls -la release-files/
-
           mv release-files/meadtools-pill.exe release-files/MeadToolsPill-Windows.exe || true
           mv release-files/meadtools-pill-linux release-files/MeadToolsPill-Linux || true
-
-          # Verify final files
           echo "Final release files:"
           ls -la release-files/
 
@@ -195,6 +181,6 @@ jobs:
 
             ### Installation Instructions:
 
-            **Windows**: Download and run the .exe file
-            **macOS**: Download and unzip the .zip file, then right-click and select "Open" on first use
+            **Windows**: Download and run the .exe file  
+            **macOS**: Download and unzip the .zip file, then right-click and select "Open" on first use  
             **Linux**: Download the Linux file, make executable with `chmod +x`, and run
