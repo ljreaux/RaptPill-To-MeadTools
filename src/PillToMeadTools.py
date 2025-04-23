@@ -13,7 +13,11 @@ import requests
 from pprint import pprint
 from time import time
 import threading
-import g_auth
+import webbrowser
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
 
 # Taken from rapt_ble on github (https://github.com/sairon/rapt-ble/blob/main/src/rapt_ble/parser.py#L14) as well as the decode_rapt_data
 RAPTPillMetricsV1 = namedtuple("RAPTPillMetrics", "version, mac, temperature, gravity, x, y, z, battery")
@@ -23,6 +27,30 @@ RAPTPillMetricsV2 = namedtuple(
 )
 PILLS = []
 WINDOW = None
+
+
+class OAuthRedirectHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        # Parse query parameters
+        parsed = urlparse(self.path)
+        print(parsed)
+        query_params = parse_qs(parsed.query)
+
+        # Extract token (or whatever key you're expecting)
+        self.server.token = query_params.get("token", [None])[0]
+
+        # Respond to the browser
+        self.send_response(200)
+        self.send_header("Content-type", "text/html")
+        self.end_headers()
+        self.wfile.write(b"<h1>Google Authentication Completed<br>You can close this window now.</h1>")
+
+        # Shut down the server after one request
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+    # Suppress logging to avoid printing to console
+    def log_message(self, format, *args):
+        return
 
 
 class MeadTools(object):
@@ -165,16 +193,26 @@ class MeadTools(object):
             print(f"Attempted with: URL: {self.__login_url__} body: {body}")
             return False
 
+    def wait_for_token(self, port=8080):
+        with HTTPServer(("localhost", port), OAuthRedirectHandler) as httpd:
+            print(f"Waiting on Authentication... http://localhost:{port} ...")
+            httpd.handle_request()
+            return httpd.token
+
     def google_auth(self):
         """Run google authentication
 
         Returns:
             bool: whether it successfully logged in or not
         """
-        result, token = g_auth.main()
-        if result:
-            self.__token__ = token
-        return result
+
+        webbrowser.open_new(self.mt_data.get("MTGAuth", "No Google Auth URL!"))
+
+        token = self.wait_for_token()
+        self.__token__ = token
+        self.mt_data["GToken"] = token
+        self.save_data()
+        return True
 
     def get_hydrometers(self):
         print(f"Getting Hydrometers from MeadTools: {self.headers} - {self.__hyrdom_url__}")
