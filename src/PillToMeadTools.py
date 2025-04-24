@@ -30,22 +30,24 @@ WINDOW = None
 
 
 class OAuthRedirectHandler(BaseHTTPRequestHandler):
+    """handle the oauth redirect and response flow"""
+
     def do_GET(self):
         # Parse query parameters
         parsed = urlparse(self.path)
         print(parsed)
         query_params = parse_qs(parsed.query)
 
-        # Extract token (or whatever key you're expecting)
+        # Extract token
         self.server.token = query_params.get("token", [None])[0]
 
-        # Respond to the browser
+        # Respond to the browser that they can close it.
         self.send_response(200)
         self.send_header("Content-type", "text/html")
         self.end_headers()
         self.wfile.write(b"<h1>Google Authentication Completed<br>You can close this window now.</h1>")
 
-        # Shut down the server after one request
+        # Shut down the server after one request - threaded as it can hang otherwise
         threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     # Suppress logging to avoid printing to console
@@ -194,6 +196,14 @@ class MeadTools(object):
             return False
 
     def wait_for_token(self, port=8080):
+        """Wait till we have a response on the specific port
+
+        Args:
+            port (int, optional): port to listen on. Defaults to 8080.
+
+        Returns:
+            str: response - in this case a token
+        """
         with HTTPServer(("localhost", port), OAuthRedirectHandler) as httpd:
             print(f"Waiting on Authentication... http://localhost:{port} ...")
             httpd.handle_request()
@@ -205,7 +215,7 @@ class MeadTools(object):
         Returns:
             bool: whether it successfully logged in or not
         """
-
+        # open a web browser
         webbrowser.open_new(self.mt_data.get("MTGAuth", "No Google Auth URL!"))
 
         token = self.wait_for_token()
