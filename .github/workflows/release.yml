@@ -91,6 +91,10 @@ jobs:
           # Check if the .app was created
           ls -lh dist/
 
+          # Required by macOS privacy/TCC before CoreBluetooth can scan.
+          /usr/libexec/PlistBuddy -c "Add :NSBluetoothAlwaysUsageDescription string MeadToolsPill uses Bluetooth to scan for RAPT Pill hydrometer advertisements." dist/MeadToolsPill.app/Contents/Info.plist
+          codesign --force --deep --sign - dist/MeadToolsPill.app
+
           # Zip the app bundle to preserve structure
           cd dist && zip -r MeadToolsPill-macOS.zip MeadToolsPill.app
         shell: bash

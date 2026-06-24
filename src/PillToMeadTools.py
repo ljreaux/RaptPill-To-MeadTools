@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import logging
 import requests
 from pprint import pprint
+from tempfile import gettempdir
 from time import time
 import threading
 import webbrowser
@@ -29,6 +30,35 @@ RAPTPillMetricsV2 = namedtuple(
 )
 PILLS = []
 WINDOW = None
+RAPT_MANUFACTURER_ID = 16722
+RAPT_NAME_PAYLOAD = b"PTdPillG1"
+
+
+def normalize_mac_address(mac_address: str) -> str:
+    """Normalize user-entered MAC addresses so '-' and ':' formats both compare cleanly."""
+    return str(mac_address or "").replace("-", ":").lower()
+
+
+def gravity_to_brix(specific_gravity: float) -> float:
+    """Convert specific gravity to estimated extract using MeadTools' polynomial."""
+    return (
+        -668.962
+        + 1262.45 * specific_gravity
+        - 776.43 * specific_gravity**2
+        + 182.94 * specific_gravity**3
+    )
+
+
+def calculate_abv(original_gravity: float, final_gravity: float) -> float:
+    """Estimate ABV using the extract-based MeadTools formula."""
+    original_extract = gravity_to_brix(original_gravity)
+    apparent_extract = gravity_to_brix(final_gravity)
+    q = 0.22 + 0.001 * original_extract
+    real_extract = (q * original_extract + apparent_extract) / (1 + q)
+    alcohol_by_weight = (original_extract - real_extract) / (
+        2.0665 - 0.010665 * original_extract
+    )
+    return alcohol_by_weight * (final_gravity / 0.794)
 
 
 class OAuthRedirectHandler(BaseHTTPRequestHandler):
@@ -231,16 +261,17 @@ class MeadTools(object):
         Returns:
             bool: whether it successfully logged in or not
         """
-        if self.ui and (self.data.get("AccessToken", None) and self.data.get("LoginType", "MeadTools") == "Google"):
-            # open a web browser
-            webbrowser.open_new(self.mt_data.get("MTGAuth", "No Google Auth URL!"))
+        if self.ui:
+            self.__token__ = self.mt_data.get("AccessToken", None)
+            if self.__token__ is None:
+                webbrowser.open_new(self.mt_data.get("MTGAuth", "No Google Auth URL!"))
 
-            token = self.wait_for_token()
-            if token == "" or token is None:
-                return
-            self.__token__ = token
-            self.mt_data["AccessToken"] = token
-            self.save_data()
+                token = self.wait_for_token()
+                if token == "" or token is None:
+                    return False
+                self.__token__ = token
+                self.mt_data["AccessToken"] = token
+                self.save_data()
             self.logged_in = self.__token__ is not None
         else:
             self.__token__ = self.mt_data.get("AccessToken", None)
@@ -451,7 +482,10 @@ class MeadTools(object):
                 self.ui.update_huds(pill)
             return True
         else:
-            self.pill_holder.log_event(f"!!! Failed to log data to MeadTools! {response} !!!", "error")
+            self.pill_holder.log_event(
+                f"!!! Failed to log data to MeadTools! {response.status_code}: {response.text} !!!",
+                "error",
+            )
             return False
 
 
@@ -492,7 +526,7 @@ class RaptPill(object):
         # than the send rate of the PILL so we make sure we are looking while it will be sending
         self.__polling_interval = int(poll_interval)
         # macaddress of pill
-        self.__mac_address = mac_address
+        self.__mac_address = normalize_mac_address(mac_address)
         # session that will be logged with data
         self.__session_name = session_name
         # device id from iSpindel endpoint on meadtools
@@ -520,6 +554,9 @@ class RaptPill(object):
         self.__battery = 100
         # When was the last event
         self.__last_event = None
+        self.__last_name_packet_log = 0
+        self.__last_seen_packet_log = 0
+        self.__last_address_match_log = 0
 
         self.mt_data = mt_data
         self.session_data = session_data
@@ -659,11 +696,15 @@ class RaptPill(object):
 
             # self.bt_scanner = BleakScanner(detection_callback=self.device_found)
             while self.running:
-                # print("Starting BLE scan...")  # ✅ This should print
-                async with BleakScanner(self.device_found) as scanner:
-                    await asyncio.sleep(self.poll_interval)
-                # print("Scan complete. Waiting for next cycle...")
-                await asyncio.sleep(10)
+                self.pill_holder.log_event(f"Starting BLE scan for {self.session_name} ({self.poll_interval}s)")
+                try:
+                    async with BleakScanner(self.device_found) as scanner:
+                        await asyncio.sleep(self.poll_interval)
+                    self.pill_holder.log_event(f"Finished BLE scan for {self.session_name}")
+                    await asyncio.sleep(10)
+                except Exception as exc:
+                    self.pill_holder.log_event(f"BLE scan failed for {self.session_name}: {exc}", "error")
+                    await asyncio.sleep(10)
 
         loop.run_until_complete(scan())
 
@@ -737,19 +778,57 @@ class RaptPill(object):
             device (BLEDevice): bluetooth device that was found
             advertisement_data (AdvertisementData): advertisment data from the found bluetooth device
         """
-        if device.address.lower() != self.__mac_address.lower():
-            return
         # Assuming the custom data is under manufacturer specific data
-        raw_data = advertisement_data.manufacturer_data.get(16722, None)
-        if raw_data == b"PTdPillG1":
+        raw_data = advertisement_data.manufacturer_data.get(RAPT_MANUFACTURER_ID, None)
+        is_rapt_payload = bool(raw_data and raw_data.startswith(b"PT"))
+        scanner_address = normalize_mac_address(device.address)
+        matched_configured_address = scanner_address == self.__mac_address
+
+        if not matched_configured_address and not is_rapt_payload:
+            return
+        if matched_configured_address and is_rapt_payload:
+            match_source = "configured MAC and RAPT payload"
+        elif matched_configured_address:
+            match_source = "configured MAC"
+        else:
+            match_source = "RAPT payload fallback"
+        if raw_data == RAPT_NAME_PAYLOAD:
+            curr_time = time()
+            if curr_time - self.__last_name_packet_log >= self.min_time:
+                self.__last_name_packet_log = curr_time
+                self.pill_holder.log_event(
+                    f"Seen RAPT name packet from scanner address {device.address} "
+                    f"(configured {self.__mac_address}; matched by {match_source}); waiting for data packet..."
+                )
             return
         if raw_data is None:
+            curr_time = time()
+            if matched_configured_address and curr_time - self.__last_address_match_log >= self.min_time:
+                self.__last_address_match_log = curr_time
+                self.pill_holder.log_event(
+                    f"Scanner address {device.address} matched configured MAC {self.__mac_address}, "
+                    "but no RAPT manufacturer payload was present."
+                )
             return
 
-        self.decode_rapt_data(raw_data)
+        curr_time = time()
+        if curr_time - self.__last_seen_packet_log >= self.min_time:
+            self.__last_seen_packet_log = curr_time
+            self.pill_holder.log_event(
+                f"Seen RAPT data packet from scanner address {device.address} "
+                f"(configured {self.__mac_address}; matched by {match_source}); payload length {len(raw_data)}"
+            )
+
+        try:
+            self.decode_rapt_data(raw_data)
+        except Exception as exc:
+            self.pill_holder.log_event(
+                f"Failed to decode RAPT packet from scanner address {device.address}: {exc}",
+                "error",
+            )
 
     def calculate_abv(self, current_gravity: float) -> float:
-        """calculate the alchol by volume given the current gravity (we estimate it by calculating against the start gravity we have stored)
+        """calculate alcohol by volume using the MeadTools OG/FG formula
 
         Args:
             current_gravity (float): current gravity value
@@ -757,7 +836,7 @@ class RaptPill(object):
         Returns:
             float: estimated abv
         """
-        return round((self.starting_gravity - current_gravity) * 131.25, 4)
+        return round(calculate_abv(self.starting_gravity, current_gravity), 4)
 
     def calculate_temp(self, kelvin: float) -> float:
         """calculate the temperature from the given kelvin value, return in C or F depending on what we have set as our default
@@ -869,14 +948,7 @@ class PillHolder(object):
     def __init__(self):
         self.appdata = self.get_datadir()
         self.curr_dir = Path(__file__).parent
-        self.log_file = self.appdata.joinpath("meadtools/sessions.log")
-        self.last_log_file = self.appdata.joinpath("meadtools/sessions_last.log")
-        if self.last_log_file.exists():
-            self.last_log_file.unlink()
-        if self.log_file.exists():
-            renamed = self.log_file.with_name("sessions_last.log")
-            self.log_file.rename(renamed)
-            self.log_file = self.curr_dir.joinpath("sessions.log")
+        self.log_file = self.prepare_log_file()
 
         self.logger = None
         if not self.logger:
@@ -935,6 +1007,22 @@ class PillHolder(object):
             return home / ".local/share"
         elif sys.platform == "darwin":
             return home / "Library/Application Support"
+
+    def prepare_log_file(self) -> Path:
+        log_dir = self.appdata.joinpath("meadtools")
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir.joinpath("sessions.log")
+            last_log_file = log_dir.joinpath("sessions_last.log")
+            if last_log_file.exists():
+                last_log_file.unlink()
+            if log_file.exists():
+                log_file.rename(last_log_file)
+            return log_file
+        except OSError:
+            log_dir = Path(gettempdir()).joinpath("meadtools")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return log_dir.joinpath("sessions.log")
 
     def check_for_release_updates(self):
         self.log_event("Checking for version update on github...")

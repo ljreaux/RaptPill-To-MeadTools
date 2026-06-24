@@ -6,6 +6,8 @@ WINDOW = None
 
 
 class PillWindow(QtWidgets.QMainWindow):
+    status_update = QtCore.Signal(str)
+
     def __init__(self, tool, parent=None):
         super().__init__()
         self.event_loop = None
@@ -63,6 +65,7 @@ class PillWindow(QtWidgets.QMainWindow):
 
         self.pbtn_login = QtWidgets.QPushButton("Login")
         self.pbtn_log = QtWidgets.QPushButton("View Log")
+        self.status_update.connect(self._update_status)
 
         self.hlay_auth.addWidget(self.rbtn_mtUser)
         self.hlay_auth.addWidget(self.rbtn_google)
@@ -216,6 +219,9 @@ class PillWindow(QtWidgets.QMainWindow):
         Args:
             message (str): message to display
         """
+        self.status_update.emit(message)
+
+    def _update_status(self, message: str):
         self.statusbar.showMessage(message, 10000)
 
     def closeEvent(self, event):
