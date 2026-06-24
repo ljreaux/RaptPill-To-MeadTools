@@ -32,6 +32,7 @@ PILLS = []
 WINDOW = None
 RAPT_MANUFACTURER_ID = 16722
 RAPT_NAME_PAYLOAD = b"PTdPillG1"
+REQUEST_TIMEOUT = 20
 
 
 def normalize_mac_address(mac_address: str) -> str:
@@ -201,7 +202,7 @@ class MeadTools(object):
             "refreshToken": self.mt_data.get("RefreshToken", None),
         }
         self.pill_holder.log_event("Refreshing login details...")
-        response = requests.post(self.__refresh_url__, json=body)
+        response = requests.post(self.__refresh_url__, json=body, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             self.mt_data["AccessToken"] = response.json().get("accessToken")
             self.__token__ = response.json().get("accessToken")
@@ -226,7 +227,7 @@ class MeadTools(object):
             "password": self.mt_data.get("MTPassword", None),
         }
         self.pill_holder.log_event("Trying to login to MeadTools...")
-        response = requests.post(self.__login_url__, json=body)
+        response = requests.post(self.__login_url__, json=body, timeout=REQUEST_TIMEOUT)
         self.pill_holder.log_event(f"LoginResponse: {response.status_code}")
         if response.status_code == 200:
             self.mt_data["RefreshToken"] = response.json().get("refreshToken")
@@ -288,7 +289,7 @@ class MeadTools(object):
     def get_hydrometers(self):
         self.pill_holder.log_event(f"Getting Hydrometers from MeadTools: {self.headers} - {self.__hyrdom_url__}")
 
-        response = requests.get(self.__hyrdom_url__, headers=self.headers)
+        response = requests.get(self.__hyrdom_url__, headers=self.headers, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             self.pill_holder.log_event(f"Hydrometers: {response.json()}")
             self.hydrometers = response.json().get("devices")
@@ -315,12 +316,19 @@ class MeadTools(object):
             f"Registering Hydrometer on MeadTools... Body: {body}  URL:{self.__reg_hydrom_url__}"
         )
         pprint(body, indent=4)
-        response = requests.post(self.__reg_hydrom_url__, json=body)
+        try:
+            response = requests.post(self.__reg_hydrom_url__, json=body, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            self.pill_holder.log_event(f"!!! Failed to register hydrometer: {exc} !!!", "error")
+            return False
         if response.status_code == 200:
-            self.pill_holder.log_event("Successfully logged data to MTools...")
+            self.pill_holder.log_event(f"Registered hydrometer on MeadTools: {response.json()}")
             return response.json().get("id", "No Id!")
         else:
-            self.pill_holder.log_event(f"!!! Failed to register hydrometer! {response} !!!")
+            self.pill_holder.log_event(
+                f"!!! Failed to register hydrometer! {response.status_code}: {response.text} !!!",
+                "error",
+            )
             return False
 
     def get_brews(self):
@@ -330,7 +338,7 @@ class MeadTools(object):
             bool: True if successful, else false
         """
         self.pill_holder.log_event(f"Getting Brews from MeadTools - {self.headers} - {self.__brews_url__}")
-        response = requests.get(self.__brews_url__, headers=self.headers)
+        response = requests.get(self.__brews_url__, headers=self.headers, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             self.pill_holder.log_event(f"Brews: {response.json()}")
             # should return just a list of brew objects
@@ -351,7 +359,7 @@ class MeadTools(object):
             "brew_name": brew_name,
         }
         self.pill_holder.log_event(f"Registering brews with MeadTools : {body}  URL:{self.__brews_url__}")
-        response = requests.post(self.__brews_url__, headers=self.headers, json=body)
+        response = requests.post(self.__brews_url__, headers=self.headers, json=body, timeout=REQUEST_TIMEOUT)
         self.pill_holder.log_event(f"Response: { response}")
         if response.status_code == 200:
             self.pill_holder.log_event(f"brews: {response.json()}")
@@ -373,7 +381,7 @@ class MeadTools(object):
             str: generated token
         """
         self.pill_holder.log_event(f"Try to register deviceId... {self.__token_url__} : headers{self.headers}")
-        response = requests.post(self.__token_url__, headers=self.headers)
+        response = requests.post(self.__token_url__, headers=self.headers, timeout=REQUEST_TIMEOUT)
         # this should respond with
         """
         "200": {
@@ -398,7 +406,7 @@ class MeadTools(object):
         brew_id = brew_data.get("id")
         self.pill_holder.log_event(f"Trying to delete brew: {self.__brews_url__}/{brew_id}")
 
-        response = requests.delete(f"{self.__brews_url__}/{brew_id}", headers=self.headers)
+        response = requests.delete(f"{self.__brews_url__}/{brew_id}", headers=self.headers, timeout=REQUEST_TIMEOUT)
         self.pill_holder.log_event(response)
 
         if response.status_code == 200:
@@ -414,7 +422,9 @@ class MeadTools(object):
             return
         body = {"recipe_id": int(recipe_id)}
         self.pill_holder.log_event(f"Trying to link brew: {body} - url: {self.__brews_url__}/{self.brewid}")
-        response = requests.patch(f"{self.__brews_url__}/{brewid}", headers=self.headers, json=body)
+        response = requests.patch(
+            f"{self.__brews_url__}/{brewid}", headers=self.headers, json=body, timeout=REQUEST_TIMEOUT
+        )
         # this should respond with
         """
         "200": {
@@ -436,7 +446,7 @@ class MeadTools(object):
         }
 
         self.pill_holder.log_event(f"Trying to end brew with {body}")
-        response = requests.patch(f"{self.__brews_url__}", headers=self.headers, json=body)
+        response = requests.patch(f"{self.__brews_url__}", headers=self.headers, json=body, timeout=REQUEST_TIMEOUT)
         # this should respond with
         """
         "200": {
@@ -461,7 +471,7 @@ class MeadTools(object):
         }
         __login_url__ = f"{self.__base_url__}/ingredients"
         self.pill_holder.log_event(__login_url__, body)
-        response = requests.get(__login_url__)
+        response = requests.get(__login_url__, timeout=REQUEST_TIMEOUT)
         self.pill_holder.log_event(response.json())
 
     def add_data_point(self, pill: RaptPill):
@@ -475,7 +485,7 @@ class MeadTools(object):
         }
         self.pill_holder.log_event(f"Sending data to MeadTools... Body: {body}  URL:{self.__pill_url__}")
         pprint(body, indent=4)
-        response = requests.post(self.__pill_url__, json=body)
+        response = requests.post(self.__pill_url__, json=body, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             self.pill_holder.log_event("Successfully logged data to MTools...")
             if self.ui:
