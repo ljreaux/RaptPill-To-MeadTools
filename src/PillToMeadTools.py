@@ -1,5 +1,6 @@
 from __future__ import annotations
 import sys
+import re
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
@@ -20,6 +21,7 @@ from tempfile import gettempdir
 from time import time
 import threading
 import webbrowser
+import traceback
 
 
 # Taken from rapt_ble on github (https://github.com/sairon/rapt-ble/blob/main/src/rapt_ble/parser.py#L14) as well as the decode_rapt_data
@@ -33,11 +35,101 @@ WINDOW = None
 RAPT_MANUFACTURER_ID = 16722
 RAPT_NAME_PAYLOAD = b"PTdPillG1"
 REQUEST_TIMEOUT = 20
+MAC_ADDRESS_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
 
 
 def normalize_mac_address(mac_address: str) -> str:
     """Normalize user-entered MAC addresses so '-' and ':' formats both compare cleanly."""
     return str(mac_address or "").replace("-", ":").lower()
+
+
+def classify_scanner_address(address: str) -> str:
+    """Classify the platform scanner address so the UI can explain what was saved."""
+    normalized = normalize_mac_address(address)
+    if MAC_ADDRESS_RE.match(normalized):
+        return "real_mac"
+    if "-" in str(address or "") and len(str(address or "")) >= 32:
+        return "platform_alias"
+    return "scanner_id"
+
+
+def calculate_temp(kelvin: float, temp_as_celsius: bool = True) -> float:
+    if temp_as_celsius:
+        return round(kelvin - 273.15, 2)
+    return round((kelvin - 273.15) * (9 / 5) + 32, 2)
+
+
+def decode_rapt_packet(data: bytes, temp_as_celsius: bool = True) -> dict:
+    """Decode a RAPT advertisement packet into a side-effect-free snapshot."""
+    if data == RAPT_NAME_PAYLOAD:
+        return {
+            "packet_type": "name",
+            "display_name": data.decode("utf-8", errors="replace"),
+            "raw_length": len(data),
+        }
+    if len(data) != 23:
+        raise ValueError("advertisment data must have length 23")
+
+    prefix, version = unpack(">2sB", data[:3])
+    if prefix != b"PT":
+        raise ValueError("Unexpected prefix")
+
+    if version == 1:
+        metrics_raw = RAPTPillMetricsV1._make(unpack(">B6sHfhhhh", data[2:]))
+        gravity_velocity = None
+    else:
+        metrics_raw = RAPTPillMetricsV2._make(unpack(">BfHfhhhH", data[4:]))
+        gravity_velocity = metrics_raw.gravityVel
+
+    return {
+        "packet_type": "data",
+        "firmware_version": version,
+        "gravity_velocity": gravity_velocity,
+        "gravity": round(metrics_raw.gravity / 1000, 4),
+        "temperature": calculate_temp(metrics_raw.temperature / 128, temp_as_celsius),
+        "temperature_c": calculate_temp(metrics_raw.temperature / 128, True),
+        "temperature_f": calculate_temp(metrics_raw.temperature / 128, False),
+        "battery": round(metrics_raw.battery / 256),
+        "x": metrics_raw.x / 16,
+        "y": metrics_raw.y / 16,
+        "z": metrics_raw.z / 16,
+        "raw_length": len(data),
+    }
+
+
+def get_advertisement_rssi(device: BLEDevice, advertisement_data: AdvertisementData):
+    return getattr(advertisement_data, "rssi", None) or getattr(device, "rssi", None)
+
+
+def rapt_discovery_snapshot(device: BLEDevice, advertisement_data: AdvertisementData) -> dict | None:
+    raw_data = advertisement_data.manufacturer_data.get(RAPT_MANUFACTURER_ID, None)
+    if not raw_data or not raw_data.startswith(b"PT"):
+        return None
+
+    decoded = {}
+    decode_error = ""
+    try:
+        decoded = decode_rapt_packet(raw_data, True)
+    except Exception as exc:
+        decode_error = str(exc)
+        decoded = {
+            "packet_type": "unknown",
+            "raw_length": len(raw_data),
+        }
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    scanner_address = str(device.address or "")
+    return {
+        "scanner_address": scanner_address,
+        "normalized_scanner_address": normalize_mac_address(scanner_address),
+        "address_type": classify_scanner_address(scanner_address),
+        "device_name": device.name or getattr(advertisement_data, "local_name", "") or "",
+        "manufacturer_id": RAPT_MANUFACTURER_ID,
+        "rssi": get_advertisement_rssi(device, advertisement_data),
+        "last_seen": now,
+        "decode_error": decode_error,
+        **decoded,
+    }
 
 
 def gravity_to_brix(specific_gravity: float) -> float:
@@ -370,6 +462,13 @@ class MeadTools(object):
             self.pill_holder.log_event(f"Failed to register brews! {response}")
             raise RuntimeError(f"Couldn't register brew:{brew_name} -  {response} : headers:{self.headers}")
 
+    def get_brew_id(self, brew):
+        if isinstance(brew, list) and len(brew):
+            return brew[0].get("id")
+        if isinstance(brew, dict):
+            return brew.get("id")
+        return None
+
     def generate_device_token(self):
         """Generate a new ispindel token - usually we don't want to do this too much - ideally we want the user to fill this
         in the data/gui instead
@@ -532,11 +631,19 @@ class RaptPill(object):
         self.thread = None
         self.running = False
         self.pill_holder = pill_holder
+        self.mt_data = mt_data
+        self.session_data = session_data
+        self.data_path = data_path
         # how often should we actively poll for data. This should ideally be slightly longer
         # than the send rate of the PILL so we make sure we are looking while it will be sending
         self.__polling_interval = int(poll_interval)
         # macaddress of pill
         self.__mac_address = normalize_mac_address(mac_address)
+        self.__device_identity = self.session_data.get("Device Identity", {}) or {}
+        self.__selected_scanner_address = normalize_mac_address(
+            self.__device_identity.get("Scanner Address", self.__mac_address)
+        )
+        self.__has_selected_identity = bool(self.__device_identity.get("Scanner Address"))
         # session that will be logged with data
         self.__session_name = session_name
         # device id from iSpindel endpoint on meadtools
@@ -567,10 +674,8 @@ class RaptPill(object):
         self.__last_name_packet_log = 0
         self.__last_seen_packet_log = 0
         self.__last_address_match_log = 0
+        self.__last_selected_missing_log = 0
 
-        self.mt_data = mt_data
-        self.session_data = session_data
-        self.data_path = data_path
         self.__log_to_db = log_to_db
         self.mtools = mtools
         if self.__log_to_db:
@@ -745,7 +850,8 @@ class RaptPill(object):
 
         if not len(self.mtools.brews):
             # if we have no brews registered, register our brew
-            self.mtools.register_brew(self.session_name, self.hydrometer_token)
+            existing_brew = self.mtools.register_brew(self.session_name, self.hydrometer_token)
+            self.brewid = self.mtools.get_brew_id(existing_brew)
         else:
             # do some checking of the brews to see if we have one registered already that matches our details
             self.pill_holder.log_event(f'Looking for brew: {self.session_data.get("BrewName")}')
@@ -768,7 +874,7 @@ class RaptPill(object):
                     "warn",
                 )
                 existing_brew = self.mtools.register_brew(self.session_name, self.hydrometer_token)
-                self.brewid = existing_brew[0].get("id")
+                self.brewid = self.mtools.get_brew_id(existing_brew)
             else:
                 self.pill_holder.log_event(
                     f"Found existing brew with name: {self.session_data.get('BrewName')} that is ongoing"
@@ -793,13 +899,39 @@ class RaptPill(object):
         is_rapt_payload = bool(raw_data and raw_data.startswith(b"PT"))
         scanner_address = normalize_mac_address(device.address)
         matched_configured_address = scanner_address == self.__mac_address
+        matched_selected_identity = bool(self.__selected_scanner_address) and (
+            scanner_address == self.__selected_scanner_address
+        )
 
-        if not matched_configured_address and not is_rapt_payload:
+        if self.__has_selected_identity and not matched_selected_identity:
+            curr_time = time()
+            if is_rapt_payload and curr_time - self.__last_selected_missing_log >= self.min_time:
+                self.__last_selected_missing_log = curr_time
+                self.pill_holder.log_event(
+                    f"Seen a RAPT packet from scanner address {device.address}, "
+                    f"but selected pill address is {self.__selected_scanner_address}; ignoring."
+                )
             return
-        if matched_configured_address and is_rapt_payload:
-            match_source = "configured MAC and RAPT payload"
+
+        if not matched_configured_address and not matched_selected_identity and not is_rapt_payload:
+            return
+        if (matched_configured_address or matched_selected_identity) and raw_data is not None and not is_rapt_payload:
+            curr_time = time()
+            if curr_time - self.__last_address_match_log >= self.min_time:
+                self.__last_address_match_log = curr_time
+                self.pill_holder.log_event(
+                    f"Scanner address {device.address} matched the configured device, "
+                    "but manufacturer data was not a RAPT payload; ignoring."
+                )
+            return
+        if matched_selected_identity and is_rapt_payload:
+            match_source = "selected scanner identity and RAPT payload"
+        elif matched_selected_identity:
+            match_source = "selected scanner identity"
+        elif matched_configured_address and is_rapt_payload:
+            match_source = "configured address and RAPT payload"
         elif matched_configured_address:
-            match_source = "configured MAC"
+            match_source = "configured address"
         else:
             match_source = "RAPT payload fallback"
         if raw_data == RAPT_NAME_PAYLOAD:
@@ -808,15 +940,18 @@ class RaptPill(object):
                 self.__last_name_packet_log = curr_time
                 self.pill_holder.log_event(
                     f"Seen RAPT name packet from scanner address {device.address} "
-                    f"(configured {self.__mac_address}; matched by {match_source}); waiting for data packet..."
+                    f"(configured {self.__mac_address}; selected {self.__selected_scanner_address}; "
+                    f"matched by {match_source}); waiting for data packet..."
                 )
             return
         if raw_data is None:
             curr_time = time()
-            if matched_configured_address and curr_time - self.__last_address_match_log >= self.min_time:
+            if (matched_configured_address or matched_selected_identity) and (
+                curr_time - self.__last_address_match_log >= self.min_time
+            ):
                 self.__last_address_match_log = curr_time
                 self.pill_holder.log_event(
-                    f"Scanner address {device.address} matched configured MAC {self.__mac_address}, "
+                    f"Scanner address {device.address} matched configured address {self.__mac_address}, "
                     "but no RAPT manufacturer payload was present."
                 )
             return
@@ -826,7 +961,8 @@ class RaptPill(object):
             self.__last_seen_packet_log = curr_time
             self.pill_holder.log_event(
                 f"Seen RAPT data packet from scanner address {device.address} "
-                f"(configured {self.__mac_address}; matched by {match_source}); payload length {len(raw_data)}"
+                f"(configured {self.__mac_address}; selected {self.__selected_scanner_address}; "
+                f"matched by {match_source}); payload length {len(raw_data)}"
             )
 
         try:
@@ -857,11 +993,7 @@ class RaptPill(object):
         Returns:
             float: temperature in F or C
         """
-        # return in c
-        if self.__is_celsius:
-            return round(kelvin - 273.15, 2)
-        # return in f
-        return (kelvin - 273.15) * (9 / 5) + 32
+        return calculate_temp(kelvin, self.__is_celsius)
 
     def decode_rapt_data(self, data: bytes):
         """Given bytes from a bluetooth advertisement, decode it into the RAPTPillMetrics tuple and return it so it can be used.
@@ -873,37 +1005,25 @@ class RaptPill(object):
             ValueError: length of data isn't correct
 
         """
-        if len(data) != 23:
-            raise ValueError("advertisment data must have length 23")
-
-        # print(f"===> raw_data: {data}")
-
-        # Extract and check the version
-        prefix, version = unpack(">2sB", data[:3])
-        # Validate the prefix
-        if prefix != b"PT":
-            raise ValueError("Unexpected prefix")
-        # get "raw" data, drop second part of the prefix ("PT"), start with the version
-        if version == 1:
-            metrics_raw = RAPTPillMetricsV1._make(unpack(">B6sHfhhhh", data[2:]))
-        else:
-            metrics_raw = RAPTPillMetricsV2._make(unpack(">BfHfhhhH", data[4:]))
+        metrics = decode_rapt_packet(data, self.__is_celsius)
+        if metrics.get("packet_type") != "data":
+            return
 
         now = datetime.now(timezone.utc)
         dt_string = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         # print("date and time =", dt_string)
         if not self.__starting_gravity_set:
-            self.starting_gravity = round(metrics_raw.gravity / 1000, 4)
-        self.__api_version = version
-        self.__gravity_velocity = metrics_raw.gravityVel
-        self.__curr_gravity = round(metrics_raw.gravity / 1000, 4)
+            self.starting_gravity = metrics["gravity"]
+        self.__api_version = metrics["firmware_version"]
+        self.__gravity_velocity = metrics.get("gravity_velocity")
+        self.__curr_gravity = metrics["gravity"]
         self.__abv = self.calculate_abv(self.__curr_gravity)
-        self.__temperature = self.calculate_temp(metrics_raw.temperature / 128)
-        self.__battery = round(metrics_raw.battery / 256)
+        self.__temperature = metrics["temperature"]
+        self.__battery = metrics["battery"]
         self.__last_event = dt_string
-        self.__x = metrics_raw.x / 16
-        self.__y = metrics_raw.y / 16
-        self.__z = metrics_raw.z / 16
+        self.__x = metrics["x"]
+        self.__y = metrics["y"]
+        self.__z = metrics["z"]
 
         if self.__log_to_db:
             curr_time = time()
@@ -1150,19 +1270,24 @@ class PillHolder(object):
                 self.update_status(f"Not logged in to MeadTools - can't start Brew: {pill.session_name}")
 
     def run_pill(self, pill_details: dict):
-        self.log_event(f"Running single pill: {pill_details.get('Session Name')}")
-        pill = RaptPill(
-            self.data,
-            pill_details,
-            self.data_path,
-            pill_details.get("BrewName", "NoSessionNameSet"),
-            self.data.get("MTDetails", {}).get("MTDeviceToken", "NO DEVICE ID"),
-            pill_details.get("Mac Address", "No Mac Address Set!"),
-            pill_details.get("Poll Interval", ""),
-            pill_holder=self,
-            temp_as_celsius=pill_details.get("Temp in C", True),
-            mtools=self.mtools,
-        )
+        self.log_event(f"Running single pill: {pill_details.get('BrewName', 'NoSessionNameSet')}")
+        try:
+            pill = RaptPill(
+                self.data,
+                pill_details,
+                self.data_path,
+                pill_details.get("BrewName", "NoSessionNameSet"),
+                self.data.get("MTDetails", {}).get("MTDeviceToken", "NO DEVICE ID"),
+                pill_details.get("Mac Address", "No Mac Address Set!"),
+                pill_details.get("Poll Interval", ""),
+                pill_holder=self,
+                temp_as_celsius=pill_details.get("Temp in C", True),
+                mtools=self.mtools,
+            )
+        except Exception as exc:
+            self.log_event(f"Failed to start pill session: {exc}\n{traceback.format_exc()}", "error")
+            self.update_status(f"Failed to start Brew: {pill_details.get('BrewName', 'No Session')}")
+            return
         self.pills.append(pill)
         if pill.mtools.logged_in:
             self.log_event("Should start pill session!")

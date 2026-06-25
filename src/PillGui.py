@@ -1,5 +1,8 @@
 from PySide6 import QtWidgets, QtCore, QtGui
 from pathlib import Path
+import asyncio
+
+import PillToMeadTools
 
 
 WINDOW = None
@@ -347,6 +350,178 @@ class LabeledLineEdit(QtWidgets.QWidget):
         self.lineEdit.setText(str(text))
 
 
+class RaptScanWorker(QtCore.QThread):
+    device_found = QtCore.Signal(dict)
+    scan_finished = QtCore.Signal(str)
+    scan_failed = QtCore.Signal(str)
+
+    def __init__(self, duration: int = 30, parent=None):
+        super().__init__(parent=parent)
+        self.duration = duration
+
+    def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        async def scan():
+            def callback(device, advertisement_data):
+                snapshot = PillToMeadTools.rapt_discovery_snapshot(device, advertisement_data)
+                if snapshot:
+                    self.device_found.emit(snapshot)
+
+            try:
+                async with PillToMeadTools.BleakScanner(callback):
+                    for _ in range(self.duration):
+                        if self.isInterruptionRequested():
+                            break
+                        await asyncio.sleep(1)
+                self.scan_finished.emit("Scan finished")
+            except Exception as exc:
+                self.scan_failed.emit(str(exc))
+
+        try:
+            loop.run_until_complete(scan())
+        finally:
+            loop.close()
+
+
+class RaptPillScanDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, duration: int = 30):
+        super().__init__(parent=parent)
+        self.duration = duration
+        self.worker = None
+        self.devices = {}
+        self.selected_device = None
+
+        self.setWindowTitle("Scan for RAPT Pills")
+        self.resize(860, 320)
+
+        self.layout = QtWidgets.QVBoxLayout(self)
+        self.layout.setContentsMargins(8, 8, 8, 8)
+        self.layout.setSpacing(6)
+        self.status_label = QtWidgets.QLabel("Scanning for RAPT Pills...")
+        self.table = QtWidgets.QTableWidget(0, 8, self)
+        self.table.setHorizontalHeaderLabels(
+            ["Device ID", "RSSI", "Last Seen", "Packet", "SG", "Temp C", "Battery", "Version"]
+        )
+        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(22)
+        self.table.setAlternatingRowColors(True)
+        self.table.setShowGrid(False)
+        self.table.setStyleSheet("QTableWidget::item { padding: 1px 4px; }")
+
+        self.buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Cancel, self)
+        self.select_button = self.buttons.addButton("Use Selected Pill", QtWidgets.QDialogButtonBox.AcceptRole)
+        self.rescan_button = self.buttons.addButton("Scan Again", QtWidgets.QDialogButtonBox.ActionRole)
+        self.select_button.setEnabled(False)
+
+        self.layout.addWidget(self.status_label)
+        self.layout.addWidget(self.table)
+        self.layout.addWidget(self.buttons)
+
+        self.table.itemSelectionChanged.connect(self.update_selection)
+        self.table.itemDoubleClicked.connect(lambda _: self.accept())
+        self.buttons.rejected.connect(self.reject)
+        self.select_button.clicked.connect(self.accept)
+        self.rescan_button.clicked.connect(self.start_scan)
+
+        self.start_scan()
+
+    def start_scan(self):
+        self.stop_scan()
+        self.devices = {}
+        self.selected_device = None
+        self.table.setRowCount(0)
+        self.select_button.setEnabled(False)
+        self.status_label.setText(f"Scanning for RAPT Pills for {self.duration} seconds...")
+        self.worker = RaptScanWorker(self.duration, self)
+        self.worker.device_found.connect(self.upsert_device)
+        self.worker.scan_finished.connect(self.scan_finished)
+        self.worker.scan_failed.connect(self.scan_failed)
+        self.worker.start()
+
+    def stop_scan(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.requestInterruption()
+            self.worker.wait(3000)
+        self.worker = None
+
+    def scan_finished(self, message: str):
+        self.status_label.setText(f"{message}. Found {len(self.devices)} RAPT device(s).")
+        self.worker = None
+
+    def scan_failed(self, message: str):
+        self.status_label.setText(f"BLE scan failed: {message}")
+        self.worker = None
+
+    def upsert_device(self, device: dict):
+        key = device.get("normalized_scanner_address") or device.get("scanner_address")
+        if not key:
+            return
+        existing = self.devices.get(key, {})
+        existing.update({k: v for k, v in device.items() if v not in [None, ""]})
+        self.devices[key] = existing
+
+        row = self.find_row(key)
+        if row is None:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            item = QtWidgets.QTableWidgetItem(key)
+            item.setData(QtCore.Qt.UserRole, key)
+            self.table.setItem(row, 0, item)
+
+        values = [
+            device.get("scanner_address", key),
+            device.get("rssi", ""),
+            device.get("last_seen", ""),
+            device.get("packet_type", ""),
+            device.get("gravity", ""),
+            device.get("temperature_c", ""),
+            device.get("battery", ""),
+            device.get("firmware_version", ""),
+        ]
+        for column, value in enumerate(values):
+            item = self.table.item(row, column) or QtWidgets.QTableWidgetItem()
+            item.setText(str(value))
+            if column == 0:
+                item.setData(QtCore.Qt.UserRole, key)
+            self.table.setItem(row, column, item)
+        self.table.resizeColumnsToContents()
+
+    def find_row(self, key: str):
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.data(QtCore.Qt.UserRole) == key:
+                return row
+        return None
+
+    def update_selection(self):
+        selected = self.table.selectedItems()
+        if not selected:
+            self.selected_device = None
+            self.select_button.setEnabled(False)
+            return
+        key = self.table.item(selected[0].row(), 0).data(QtCore.Qt.UserRole)
+        self.selected_device = self.devices.get(key)
+        self.select_button.setEnabled(bool(self.selected_device))
+
+    def accept(self):
+        self.update_selection()
+        if not self.selected_device:
+            return
+        self.stop_scan()
+        super().accept()
+
+    def reject(self):
+        self.stop_scan()
+        super().reject()
+
+
 class PillWidget(QtWidgets.QWidget):
     def __init__(self, session_data: dict, frame, ui):
         super().__init__(parent=ui)
@@ -362,6 +537,7 @@ class PillWidget(QtWidgets.QWidget):
         self.hlay_hud = QtWidgets.QHBoxLayout()
         self.hlay_hud.setAlignment(QtCore.Qt.AlignLeft)
         self.hlay_deviceToken = QtWidgets.QHBoxLayout()
+        self.hlay_macAddress = QtWidgets.QHBoxLayout()
 
         self.pbtn_remove = QtWidgets.QPushButton(" X ")
         self.pbtn_remove.setToolTip("Remove the current brew data")
@@ -401,7 +577,11 @@ class PillWidget(QtWidgets.QWidget):
         self.labLineE_brewName = LabeledLineEdit("Brew Name:", "", False, self)
         self.labLineE_name = LabeledLineEdit("Pill Name:", "", False, self)
         self.labLineE_macAddress = LabeledLineEdit("Pill MAC Address:", "", False, self)
+        self.pbtn_scanPills = QtWidgets.QPushButton("Scan for Pills")
         self.labLineE_pollInterval = LabeledLineEdit("Poll Interval:", "", False, self)
+
+        self.hlay_macAddress.addWidget(self.labLineE_macAddress)
+        self.hlay_macAddress.addWidget(self.pbtn_scanPills)
 
         self.chkbox_tempUnit = QtWidgets.QCheckBox("Temp in C?")
         self.chkbox_tempUnit.setChecked(True)
@@ -415,7 +595,7 @@ class PillWidget(QtWidgets.QWidget):
         self.main_layout.addWidget(self.labLineE_name)
         self.main_layout.addWidget(self.labLineE_recipeId)
         self.main_layout.addWidget(self.labLineE_brewName)
-        self.main_layout.addWidget(self.labLineE_macAddress)
+        self.main_layout.addLayout(self.hlay_macAddress)
         self.main_layout.addWidget(self.labLineE_pollInterval)
         self.main_layout.addWidget(self.chkbox_tempUnit)
         self.main_layout.addWidget(self.pbtn_start_session)
@@ -439,6 +619,7 @@ class PillWidget(QtWidgets.QWidget):
             "Poll Interval": "",
             "Temp in C": False,
             "MTRecipeId": -1,
+            "Device Identity": {},
         }
         repr["BrewName"] = self.labLineE_brewName.text
         repr["Pill Name"] = self.labLineE_name.text
@@ -446,6 +627,7 @@ class PillWidget(QtWidgets.QWidget):
         repr["Poll Interval"] = self.labLineE_pollInterval.text
         repr["Temp in C"] = self.chkbox_tempUnit.isChecked()
         repr["MTRecipeId"] = int(self.labLineE_recipeId.text)
+        repr["Device Identity"] = self.data.get("Device Identity", {})
         return repr
 
     def connect_ui(self):
@@ -466,6 +648,7 @@ class PillWidget(QtWidgets.QWidget):
         self.labLineE_pollInterval.lineEdit.editingFinished.connect(self.save_data)
         self.labLineE_recipeId.lineEdit.editingFinished.connect(self.save_data)
         self.pbtn_start_session.clicked.connect(self.start_session)
+        self.pbtn_scanPills.clicked.connect(self.scan_for_pills)
         self.chkbox_tempUnit.checkStateChanged.connect(self.save_data)
 
     def update_hud(self, pill):
@@ -516,6 +699,40 @@ class PillWidget(QtWidgets.QWidget):
         self.labLineE_brewName.set_text(brew_name)
         self.save_data()
 
+    def scan_for_pills(self):
+        dialog = RaptPillScanDialog(self)
+        if dialog.exec() != QtWidgets.QDialog.Accepted or not dialog.selected_device:
+            return
+
+        selected = dialog.selected_device
+        default_name = self.labLineE_name.text or selected.get("device_name") or self.labLineE_brewName.text or "RAPT Pill"
+        pill_name, accepted = QtWidgets.QInputDialog.getText(
+            self,
+            "Pill Name",
+            "Name this pill:",
+            QtWidgets.QLineEdit.Normal,
+            default_name,
+        )
+        if not accepted:
+            return
+
+        scanner_address = selected.get("scanner_address", "")
+        self.labLineE_name.set_text(pill_name.strip() or default_name)
+        self.labLineE_macAddress.set_text(scanner_address)
+        self.data["Device Identity"] = {
+            "Platform": PillToMeadTools.sys.platform,
+            "Address Type": selected.get("address_type", "scanner_id"),
+            "Scanner Address": scanner_address,
+            "Normalized Scanner Address": selected.get("normalized_scanner_address", ""),
+            "Manufacturer ID": selected.get("manufacturer_id", PillToMeadTools.RAPT_MANUFACTURER_ID),
+            "Last RSSI": selected.get("rssi", ""),
+            "Last Packet Type": selected.get("packet_type", ""),
+            "Last Decoded Packet Version": selected.get("firmware_version", ""),
+            "Last Seen": selected.get("last_seen", ""),
+        }
+        self.save_data()
+        self.ui.update_status(f"Selected RAPT Pill: {self.labLineE_name.text}")
+
     def start_session(self):
         """Start the session(s)"""
         self.running = not self.running
@@ -545,6 +762,7 @@ class PillWidget(QtWidgets.QWidget):
         self.data["Poll Interval"] = self.labLineE_pollInterval.text
         self.data["Temp in C"] = self.chkbox_tempUnit.isChecked()
         self.data["MTRecipeId"] = int(self.labLineE_recipeId.text)
+        self.data["Device Identity"] = self.data.get("Device Identity", {})
         self.ui.update_status("Saving Brew Data...")
         self.ui.tool.mtools.save_data()
 
