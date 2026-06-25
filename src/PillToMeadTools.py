@@ -1,5 +1,6 @@
 from __future__ import annotations
 import sys
+import re
 from bleak import BleakScanner
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
@@ -16,9 +17,11 @@ from datetime import datetime, timezone
 import logging
 import requests
 from pprint import pprint
+from tempfile import gettempdir
 from time import time
 import threading
 import webbrowser
+import traceback
 
 
 # Taken from rapt_ble on github (https://github.com/sairon/rapt-ble/blob/main/src/rapt_ble/parser.py#L14) as well as the decode_rapt_data
@@ -29,6 +32,126 @@ RAPTPillMetricsV2 = namedtuple(
 )
 PILLS = []
 WINDOW = None
+RAPT_MANUFACTURER_ID = 16722
+RAPT_NAME_PAYLOAD = b"PTdPillG1"
+REQUEST_TIMEOUT = 20
+MAC_ADDRESS_RE = re.compile(r"^[0-9a-f]{2}(:[0-9a-f]{2}){5}$")
+
+
+def normalize_mac_address(mac_address: str) -> str:
+    """Normalize user-entered MAC addresses so '-' and ':' formats both compare cleanly."""
+    return str(mac_address or "").replace("-", ":").lower()
+
+
+def classify_scanner_address(address: str) -> str:
+    """Classify the platform scanner address so the UI can explain what was saved."""
+    normalized = normalize_mac_address(address)
+    if MAC_ADDRESS_RE.match(normalized):
+        return "real_mac"
+    if "-" in str(address or "") and len(str(address or "")) >= 32:
+        return "platform_alias"
+    return "scanner_id"
+
+
+def calculate_temp(kelvin: float, temp_as_celsius: bool = True) -> float:
+    if temp_as_celsius:
+        return round(kelvin - 273.15, 2)
+    return round((kelvin - 273.15) * (9 / 5) + 32, 2)
+
+
+def decode_rapt_packet(data: bytes, temp_as_celsius: bool = True) -> dict:
+    """Decode a RAPT advertisement packet into a side-effect-free snapshot."""
+    if data == RAPT_NAME_PAYLOAD:
+        return {
+            "packet_type": "name",
+            "display_name": data.decode("utf-8", errors="replace"),
+            "raw_length": len(data),
+        }
+    if len(data) != 23:
+        raise ValueError("advertisment data must have length 23")
+
+    prefix, version = unpack(">2sB", data[:3])
+    if prefix != b"PT":
+        raise ValueError("Unexpected prefix")
+
+    if version == 1:
+        metrics_raw = RAPTPillMetricsV1._make(unpack(">B6sHfhhhh", data[2:]))
+        gravity_velocity = None
+    else:
+        metrics_raw = RAPTPillMetricsV2._make(unpack(">BfHfhhhH", data[4:]))
+        gravity_velocity = metrics_raw.gravityVel
+
+    return {
+        "packet_type": "data",
+        "firmware_version": version,
+        "gravity_velocity": gravity_velocity,
+        "gravity": round(metrics_raw.gravity / 1000, 4),
+        "temperature": calculate_temp(metrics_raw.temperature / 128, temp_as_celsius),
+        "temperature_c": calculate_temp(metrics_raw.temperature / 128, True),
+        "temperature_f": calculate_temp(metrics_raw.temperature / 128, False),
+        "battery": round(metrics_raw.battery / 256),
+        "x": metrics_raw.x / 16,
+        "y": metrics_raw.y / 16,
+        "z": metrics_raw.z / 16,
+        "raw_length": len(data),
+    }
+
+
+def get_advertisement_rssi(device: BLEDevice, advertisement_data: AdvertisementData):
+    return getattr(advertisement_data, "rssi", None) or getattr(device, "rssi", None)
+
+
+def rapt_discovery_snapshot(device: BLEDevice, advertisement_data: AdvertisementData) -> dict | None:
+    raw_data = advertisement_data.manufacturer_data.get(RAPT_MANUFACTURER_ID, None)
+    if not raw_data or not raw_data.startswith(b"PT"):
+        return None
+
+    decoded = {}
+    decode_error = ""
+    try:
+        decoded = decode_rapt_packet(raw_data, True)
+    except Exception as exc:
+        decode_error = str(exc)
+        decoded = {
+            "packet_type": "unknown",
+            "raw_length": len(raw_data),
+        }
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    scanner_address = str(device.address or "")
+    return {
+        "scanner_address": scanner_address,
+        "normalized_scanner_address": normalize_mac_address(scanner_address),
+        "address_type": classify_scanner_address(scanner_address),
+        "device_name": device.name or getattr(advertisement_data, "local_name", "") or "",
+        "manufacturer_id": RAPT_MANUFACTURER_ID,
+        "rssi": get_advertisement_rssi(device, advertisement_data),
+        "last_seen": now,
+        "decode_error": decode_error,
+        **decoded,
+    }
+
+
+def gravity_to_brix(specific_gravity: float) -> float:
+    """Convert specific gravity to estimated extract using MeadTools' polynomial."""
+    return (
+        -668.962
+        + 1262.45 * specific_gravity
+        - 776.43 * specific_gravity**2
+        + 182.94 * specific_gravity**3
+    )
+
+
+def calculate_abv(original_gravity: float, final_gravity: float) -> float:
+    """Estimate ABV using the extract-based MeadTools formula."""
+    original_extract = gravity_to_brix(original_gravity)
+    apparent_extract = gravity_to_brix(final_gravity)
+    q = 0.22 + 0.001 * original_extract
+    real_extract = (q * original_extract + apparent_extract) / (1 + q)
+    alcohol_by_weight = (original_extract - real_extract) / (
+        2.0665 - 0.010665 * original_extract
+    )
+    return alcohol_by_weight * (final_gravity / 0.794)
 
 
 class OAuthRedirectHandler(BaseHTTPRequestHandler):
@@ -171,7 +294,7 @@ class MeadTools(object):
             "refreshToken": self.mt_data.get("RefreshToken", None),
         }
         self.pill_holder.log_event("Refreshing login details...")
-        response = requests.post(self.__refresh_url__, json=body)
+        response = requests.post(self.__refresh_url__, json=body, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             self.mt_data["AccessToken"] = response.json().get("accessToken")
             self.__token__ = response.json().get("accessToken")
@@ -196,7 +319,7 @@ class MeadTools(object):
             "password": self.mt_data.get("MTPassword", None),
         }
         self.pill_holder.log_event("Trying to login to MeadTools...")
-        response = requests.post(self.__login_url__, json=body)
+        response = requests.post(self.__login_url__, json=body, timeout=REQUEST_TIMEOUT)
         self.pill_holder.log_event(f"LoginResponse: {response.status_code}")
         if response.status_code == 200:
             self.mt_data["RefreshToken"] = response.json().get("refreshToken")
@@ -231,16 +354,17 @@ class MeadTools(object):
         Returns:
             bool: whether it successfully logged in or not
         """
-        if self.ui and (self.data.get("AccessToken", None) and self.data.get("LoginType", "MeadTools") == "Google"):
-            # open a web browser
-            webbrowser.open_new(self.mt_data.get("MTGAuth", "No Google Auth URL!"))
+        if self.ui:
+            self.__token__ = self.mt_data.get("AccessToken", None)
+            if self.__token__ is None:
+                webbrowser.open_new(self.mt_data.get("MTGAuth", "No Google Auth URL!"))
 
-            token = self.wait_for_token()
-            if token == "" or token is None:
-                return
-            self.__token__ = token
-            self.mt_data["AccessToken"] = token
-            self.save_data()
+                token = self.wait_for_token()
+                if token == "" or token is None:
+                    return False
+                self.__token__ = token
+                self.mt_data["AccessToken"] = token
+                self.save_data()
             self.logged_in = self.__token__ is not None
         else:
             self.__token__ = self.mt_data.get("AccessToken", None)
@@ -257,7 +381,7 @@ class MeadTools(object):
     def get_hydrometers(self):
         self.pill_holder.log_event(f"Getting Hydrometers from MeadTools: {self.headers} - {self.__hyrdom_url__}")
 
-        response = requests.get(self.__hyrdom_url__, headers=self.headers)
+        response = requests.get(self.__hyrdom_url__, headers=self.headers, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             self.pill_holder.log_event(f"Hydrometers: {response.json()}")
             self.hydrometers = response.json().get("devices")
@@ -284,12 +408,19 @@ class MeadTools(object):
             f"Registering Hydrometer on MeadTools... Body: {body}  URL:{self.__reg_hydrom_url__}"
         )
         pprint(body, indent=4)
-        response = requests.post(self.__reg_hydrom_url__, json=body)
+        try:
+            response = requests.post(self.__reg_hydrom_url__, json=body, timeout=REQUEST_TIMEOUT)
+        except requests.RequestException as exc:
+            self.pill_holder.log_event(f"!!! Failed to register hydrometer: {exc} !!!", "error")
+            return False
         if response.status_code == 200:
-            self.pill_holder.log_event("Successfully logged data to MTools...")
+            self.pill_holder.log_event(f"Registered hydrometer on MeadTools: {response.json()}")
             return response.json().get("id", "No Id!")
         else:
-            self.pill_holder.log_event(f"!!! Failed to register hydrometer! {response} !!!")
+            self.pill_holder.log_event(
+                f"!!! Failed to register hydrometer! {response.status_code}: {response.text} !!!",
+                "error",
+            )
             return False
 
     def get_brews(self):
@@ -299,7 +430,7 @@ class MeadTools(object):
             bool: True if successful, else false
         """
         self.pill_holder.log_event(f"Getting Brews from MeadTools - {self.headers} - {self.__brews_url__}")
-        response = requests.get(self.__brews_url__, headers=self.headers)
+        response = requests.get(self.__brews_url__, headers=self.headers, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             self.pill_holder.log_event(f"Brews: {response.json()}")
             # should return just a list of brew objects
@@ -320,7 +451,7 @@ class MeadTools(object):
             "brew_name": brew_name,
         }
         self.pill_holder.log_event(f"Registering brews with MeadTools : {body}  URL:{self.__brews_url__}")
-        response = requests.post(self.__brews_url__, headers=self.headers, json=body)
+        response = requests.post(self.__brews_url__, headers=self.headers, json=body, timeout=REQUEST_TIMEOUT)
         self.pill_holder.log_event(f"Response: { response}")
         if response.status_code == 200:
             self.pill_holder.log_event(f"brews: {response.json()}")
@@ -330,6 +461,13 @@ class MeadTools(object):
         else:
             self.pill_holder.log_event(f"Failed to register brews! {response}")
             raise RuntimeError(f"Couldn't register brew:{brew_name} -  {response} : headers:{self.headers}")
+
+    def get_brew_id(self, brew):
+        if isinstance(brew, list) and len(brew):
+            return brew[0].get("id")
+        if isinstance(brew, dict):
+            return brew.get("id")
+        return None
 
     def generate_device_token(self):
         """Generate a new ispindel token - usually we don't want to do this too much - ideally we want the user to fill this
@@ -342,7 +480,7 @@ class MeadTools(object):
             str: generated token
         """
         self.pill_holder.log_event(f"Try to register deviceId... {self.__token_url__} : headers{self.headers}")
-        response = requests.post(self.__token_url__, headers=self.headers)
+        response = requests.post(self.__token_url__, headers=self.headers, timeout=REQUEST_TIMEOUT)
         # this should respond with
         """
         "200": {
@@ -367,7 +505,7 @@ class MeadTools(object):
         brew_id = brew_data.get("id")
         self.pill_holder.log_event(f"Trying to delete brew: {self.__brews_url__}/{brew_id}")
 
-        response = requests.delete(f"{self.__brews_url__}/{brew_id}", headers=self.headers)
+        response = requests.delete(f"{self.__brews_url__}/{brew_id}", headers=self.headers, timeout=REQUEST_TIMEOUT)
         self.pill_holder.log_event(response)
 
         if response.status_code == 200:
@@ -383,7 +521,9 @@ class MeadTools(object):
             return
         body = {"recipe_id": int(recipe_id)}
         self.pill_holder.log_event(f"Trying to link brew: {body} - url: {self.__brews_url__}/{self.brewid}")
-        response = requests.patch(f"{self.__brews_url__}/{brewid}", headers=self.headers, json=body)
+        response = requests.patch(
+            f"{self.__brews_url__}/{brewid}", headers=self.headers, json=body, timeout=REQUEST_TIMEOUT
+        )
         # this should respond with
         """
         "200": {
@@ -405,7 +545,7 @@ class MeadTools(object):
         }
 
         self.pill_holder.log_event(f"Trying to end brew with {body}")
-        response = requests.patch(f"{self.__brews_url__}", headers=self.headers, json=body)
+        response = requests.patch(f"{self.__brews_url__}", headers=self.headers, json=body, timeout=REQUEST_TIMEOUT)
         # this should respond with
         """
         "200": {
@@ -430,7 +570,7 @@ class MeadTools(object):
         }
         __login_url__ = f"{self.__base_url__}/ingredients"
         self.pill_holder.log_event(__login_url__, body)
-        response = requests.get(__login_url__)
+        response = requests.get(__login_url__, timeout=REQUEST_TIMEOUT)
         self.pill_holder.log_event(response.json())
 
     def add_data_point(self, pill: RaptPill):
@@ -444,14 +584,17 @@ class MeadTools(object):
         }
         self.pill_holder.log_event(f"Sending data to MeadTools... Body: {body}  URL:{self.__pill_url__}")
         pprint(body, indent=4)
-        response = requests.post(self.__pill_url__, json=body)
+        response = requests.post(self.__pill_url__, json=body, timeout=REQUEST_TIMEOUT)
         if response.status_code == 200:
             self.pill_holder.log_event("Successfully logged data to MTools...")
             if self.ui:
                 self.ui.update_huds(pill)
             return True
         else:
-            self.pill_holder.log_event(f"!!! Failed to log data to MeadTools! {response} !!!", "error")
+            self.pill_holder.log_event(
+                f"!!! Failed to log data to MeadTools! {response.status_code}: {response.text} !!!",
+                "error",
+            )
             return False
 
 
@@ -488,11 +631,19 @@ class RaptPill(object):
         self.thread = None
         self.running = False
         self.pill_holder = pill_holder
+        self.mt_data = mt_data
+        self.session_data = session_data
+        self.data_path = data_path
         # how often should we actively poll for data. This should ideally be slightly longer
         # than the send rate of the PILL so we make sure we are looking while it will be sending
         self.__polling_interval = int(poll_interval)
         # macaddress of pill
-        self.__mac_address = mac_address
+        self.__mac_address = normalize_mac_address(mac_address)
+        self.__device_identity = self.session_data.get("Device Identity", {}) or {}
+        self.__selected_scanner_address = normalize_mac_address(
+            self.__device_identity.get("Scanner Address", self.__mac_address)
+        )
+        self.__has_selected_identity = bool(self.__device_identity.get("Scanner Address"))
         # session that will be logged with data
         self.__session_name = session_name
         # device id from iSpindel endpoint on meadtools
@@ -520,10 +671,11 @@ class RaptPill(object):
         self.__battery = 100
         # When was the last event
         self.__last_event = None
+        self.__last_name_packet_log = 0
+        self.__last_seen_packet_log = 0
+        self.__last_address_match_log = 0
+        self.__last_selected_missing_log = 0
 
-        self.mt_data = mt_data
-        self.session_data = session_data
-        self.data_path = data_path
         self.__log_to_db = log_to_db
         self.mtools = mtools
         if self.__log_to_db:
@@ -659,11 +811,15 @@ class RaptPill(object):
 
             # self.bt_scanner = BleakScanner(detection_callback=self.device_found)
             while self.running:
-                # print("Starting BLE scan...")  # ✅ This should print
-                async with BleakScanner(self.device_found) as scanner:
-                    await asyncio.sleep(self.poll_interval)
-                # print("Scan complete. Waiting for next cycle...")
-                await asyncio.sleep(10)
+                self.pill_holder.log_event(f"Starting BLE scan for {self.session_name} ({self.poll_interval}s)")
+                try:
+                    async with BleakScanner(self.device_found) as scanner:
+                        await asyncio.sleep(self.poll_interval)
+                    self.pill_holder.log_event(f"Finished BLE scan for {self.session_name}")
+                    await asyncio.sleep(10)
+                except Exception as exc:
+                    self.pill_holder.log_event(f"BLE scan failed for {self.session_name}: {exc}", "error")
+                    await asyncio.sleep(10)
 
         loop.run_until_complete(scan())
 
@@ -694,7 +850,8 @@ class RaptPill(object):
 
         if not len(self.mtools.brews):
             # if we have no brews registered, register our brew
-            self.mtools.register_brew(self.session_name, self.hydrometer_token)
+            existing_brew = self.mtools.register_brew(self.session_name, self.hydrometer_token)
+            self.brewid = self.mtools.get_brew_id(existing_brew)
         else:
             # do some checking of the brews to see if we have one registered already that matches our details
             self.pill_holder.log_event(f'Looking for brew: {self.session_data.get("BrewName")}')
@@ -717,7 +874,7 @@ class RaptPill(object):
                     "warn",
                 )
                 existing_brew = self.mtools.register_brew(self.session_name, self.hydrometer_token)
-                self.brewid = existing_brew[0].get("id")
+                self.brewid = self.mtools.get_brew_id(existing_brew)
             else:
                 self.pill_holder.log_event(
                     f"Found existing brew with name: {self.session_data.get('BrewName')} that is ongoing"
@@ -737,19 +894,87 @@ class RaptPill(object):
             device (BLEDevice): bluetooth device that was found
             advertisement_data (AdvertisementData): advertisment data from the found bluetooth device
         """
-        if device.address.lower() != self.__mac_address.lower():
-            return
         # Assuming the custom data is under manufacturer specific data
-        raw_data = advertisement_data.manufacturer_data.get(16722, None)
-        if raw_data == b"PTdPillG1":
+        raw_data = advertisement_data.manufacturer_data.get(RAPT_MANUFACTURER_ID, None)
+        is_rapt_payload = bool(raw_data and raw_data.startswith(b"PT"))
+        scanner_address = normalize_mac_address(device.address)
+        matched_configured_address = scanner_address == self.__mac_address
+        matched_selected_identity = bool(self.__selected_scanner_address) and (
+            scanner_address == self.__selected_scanner_address
+        )
+
+        if self.__has_selected_identity and not matched_selected_identity:
+            curr_time = time()
+            if is_rapt_payload and curr_time - self.__last_selected_missing_log >= self.min_time:
+                self.__last_selected_missing_log = curr_time
+                self.pill_holder.log_event(
+                    f"Seen a RAPT packet from scanner address {device.address}, "
+                    f"but selected pill address is {self.__selected_scanner_address}; ignoring."
+                )
+            return
+
+        if not matched_configured_address and not matched_selected_identity and not is_rapt_payload:
+            return
+        if (matched_configured_address or matched_selected_identity) and raw_data is not None and not is_rapt_payload:
+            curr_time = time()
+            if curr_time - self.__last_address_match_log >= self.min_time:
+                self.__last_address_match_log = curr_time
+                self.pill_holder.log_event(
+                    f"Scanner address {device.address} matched the configured device, "
+                    "but manufacturer data was not a RAPT payload; ignoring."
+                )
+            return
+        if matched_selected_identity and is_rapt_payload:
+            match_source = "selected scanner identity and RAPT payload"
+        elif matched_selected_identity:
+            match_source = "selected scanner identity"
+        elif matched_configured_address and is_rapt_payload:
+            match_source = "configured address and RAPT payload"
+        elif matched_configured_address:
+            match_source = "configured address"
+        else:
+            match_source = "RAPT payload fallback"
+        if raw_data == RAPT_NAME_PAYLOAD:
+            curr_time = time()
+            if curr_time - self.__last_name_packet_log >= self.min_time:
+                self.__last_name_packet_log = curr_time
+                self.pill_holder.log_event(
+                    f"Seen RAPT name packet from scanner address {device.address} "
+                    f"(configured {self.__mac_address}; selected {self.__selected_scanner_address}; "
+                    f"matched by {match_source}); waiting for data packet..."
+                )
             return
         if raw_data is None:
+            curr_time = time()
+            if (matched_configured_address or matched_selected_identity) and (
+                curr_time - self.__last_address_match_log >= self.min_time
+            ):
+                self.__last_address_match_log = curr_time
+                self.pill_holder.log_event(
+                    f"Scanner address {device.address} matched configured address {self.__mac_address}, "
+                    "but no RAPT manufacturer payload was present."
+                )
             return
 
-        self.decode_rapt_data(raw_data)
+        curr_time = time()
+        if curr_time - self.__last_seen_packet_log >= self.min_time:
+            self.__last_seen_packet_log = curr_time
+            self.pill_holder.log_event(
+                f"Seen RAPT data packet from scanner address {device.address} "
+                f"(configured {self.__mac_address}; selected {self.__selected_scanner_address}; "
+                f"matched by {match_source}); payload length {len(raw_data)}"
+            )
+
+        try:
+            self.decode_rapt_data(raw_data)
+        except Exception as exc:
+            self.pill_holder.log_event(
+                f"Failed to decode RAPT packet from scanner address {device.address}: {exc}",
+                "error",
+            )
 
     def calculate_abv(self, current_gravity: float) -> float:
-        """calculate the alchol by volume given the current gravity (we estimate it by calculating against the start gravity we have stored)
+        """calculate alcohol by volume using the MeadTools OG/FG formula
 
         Args:
             current_gravity (float): current gravity value
@@ -757,7 +982,7 @@ class RaptPill(object):
         Returns:
             float: estimated abv
         """
-        return round((self.starting_gravity - current_gravity) * 131.25, 4)
+        return round(calculate_abv(self.starting_gravity, current_gravity), 4)
 
     def calculate_temp(self, kelvin: float) -> float:
         """calculate the temperature from the given kelvin value, return in C or F depending on what we have set as our default
@@ -768,11 +993,7 @@ class RaptPill(object):
         Returns:
             float: temperature in F or C
         """
-        # return in c
-        if self.__is_celsius:
-            return round(kelvin - 273.15, 2)
-        # return in f
-        return (kelvin - 273.15) * (9 / 5) + 32
+        return calculate_temp(kelvin, self.__is_celsius)
 
     def decode_rapt_data(self, data: bytes):
         """Given bytes from a bluetooth advertisement, decode it into the RAPTPillMetrics tuple and return it so it can be used.
@@ -784,37 +1005,25 @@ class RaptPill(object):
             ValueError: length of data isn't correct
 
         """
-        if len(data) != 23:
-            raise ValueError("advertisment data must have length 23")
-
-        # print(f"===> raw_data: {data}")
-
-        # Extract and check the version
-        prefix, version = unpack(">2sB", data[:3])
-        # Validate the prefix
-        if prefix != b"PT":
-            raise ValueError("Unexpected prefix")
-        # get "raw" data, drop second part of the prefix ("PT"), start with the version
-        if version == 1:
-            metrics_raw = RAPTPillMetricsV1._make(unpack(">B6sHfhhhh", data[2:]))
-        else:
-            metrics_raw = RAPTPillMetricsV2._make(unpack(">BfHfhhhH", data[4:]))
+        metrics = decode_rapt_packet(data, self.__is_celsius)
+        if metrics.get("packet_type") != "data":
+            return
 
         now = datetime.now(timezone.utc)
         dt_string = now.strftime("%Y-%m-%dT%H:%M:%SZ")
         # print("date and time =", dt_string)
         if not self.__starting_gravity_set:
-            self.starting_gravity = round(metrics_raw.gravity / 1000, 4)
-        self.__api_version = version
-        self.__gravity_velocity = metrics_raw.gravityVel
-        self.__curr_gravity = round(metrics_raw.gravity / 1000, 4)
+            self.starting_gravity = metrics["gravity"]
+        self.__api_version = metrics["firmware_version"]
+        self.__gravity_velocity = metrics.get("gravity_velocity")
+        self.__curr_gravity = metrics["gravity"]
         self.__abv = self.calculate_abv(self.__curr_gravity)
-        self.__temperature = self.calculate_temp(metrics_raw.temperature / 128)
-        self.__battery = round(metrics_raw.battery / 256)
+        self.__temperature = metrics["temperature"]
+        self.__battery = metrics["battery"]
         self.__last_event = dt_string
-        self.__x = metrics_raw.x / 16
-        self.__y = metrics_raw.y / 16
-        self.__z = metrics_raw.z / 16
+        self.__x = metrics["x"]
+        self.__y = metrics["y"]
+        self.__z = metrics["z"]
 
         if self.__log_to_db:
             curr_time = time()
@@ -869,14 +1078,7 @@ class PillHolder(object):
     def __init__(self):
         self.appdata = self.get_datadir()
         self.curr_dir = Path(__file__).parent
-        self.log_file = self.appdata.joinpath("meadtools/sessions.log")
-        self.last_log_file = self.appdata.joinpath("meadtools/sessions_last.log")
-        if self.last_log_file.exists():
-            self.last_log_file.unlink()
-        if self.log_file.exists():
-            renamed = self.log_file.with_name("sessions_last.log")
-            self.log_file.rename(renamed)
-            self.log_file = self.curr_dir.joinpath("sessions.log")
+        self.log_file = self.prepare_log_file()
 
         self.logger = None
         if not self.logger:
@@ -935,6 +1137,22 @@ class PillHolder(object):
             return home / ".local/share"
         elif sys.platform == "darwin":
             return home / "Library/Application Support"
+
+    def prepare_log_file(self) -> Path:
+        log_dir = self.appdata.joinpath("meadtools")
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = log_dir.joinpath("sessions.log")
+            last_log_file = log_dir.joinpath("sessions_last.log")
+            if last_log_file.exists():
+                last_log_file.unlink()
+            if log_file.exists():
+                log_file.rename(last_log_file)
+            return log_file
+        except OSError:
+            log_dir = Path(gettempdir()).joinpath("meadtools")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            return log_dir.joinpath("sessions.log")
 
     def check_for_release_updates(self):
         self.log_event("Checking for version update on github...")
@@ -1052,19 +1270,24 @@ class PillHolder(object):
                 self.update_status(f"Not logged in to MeadTools - can't start Brew: {pill.session_name}")
 
     def run_pill(self, pill_details: dict):
-        self.log_event(f"Running single pill: {pill_details.get('Session Name')}")
-        pill = RaptPill(
-            self.data,
-            pill_details,
-            self.data_path,
-            pill_details.get("BrewName", "NoSessionNameSet"),
-            self.data.get("MTDetails", {}).get("MTDeviceToken", "NO DEVICE ID"),
-            pill_details.get("Mac Address", "No Mac Address Set!"),
-            pill_details.get("Poll Interval", ""),
-            pill_holder=self,
-            temp_as_celsius=pill_details.get("Temp in C", True),
-            mtools=self.mtools,
-        )
+        self.log_event(f"Running single pill: {pill_details.get('BrewName', 'NoSessionNameSet')}")
+        try:
+            pill = RaptPill(
+                self.data,
+                pill_details,
+                self.data_path,
+                pill_details.get("BrewName", "NoSessionNameSet"),
+                self.data.get("MTDetails", {}).get("MTDeviceToken", "NO DEVICE ID"),
+                pill_details.get("Mac Address", "No Mac Address Set!"),
+                pill_details.get("Poll Interval", ""),
+                pill_holder=self,
+                temp_as_celsius=pill_details.get("Temp in C", True),
+                mtools=self.mtools,
+            )
+        except Exception as exc:
+            self.log_event(f"Failed to start pill session: {exc}\n{traceback.format_exc()}", "error")
+            self.update_status(f"Failed to start Brew: {pill_details.get('BrewName', 'No Session')}")
+            return
         self.pills.append(pill)
         if pill.mtools.logged_in:
             self.log_event("Should start pill session!")
