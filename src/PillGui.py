@@ -187,13 +187,13 @@ class PillWindow(QtWidgets.QMainWindow):
     def login_to_meadtools(self):
         """attempt to login to meadtools"""
         if self.rbtngrp.checkedId() == 0:
-            self.tool.data["MTDetails"]["MTEmail"] = self.lablineE_username.text
-            self.tool.data["MTDetails"]["MTPassword"] = self.lablineE_password.text
+            self.mdata["LoginType"] = "MeadTools"
+            self.mdata["MTEmail"] = self.lablineE_username.text
+            self.mdata["MTPassword"] = self.lablineE_password.text
             self.tool.mtools.save_data()
             success = self.tool.mtools.handle_login()
             if success:
                 self.update_status("Successfully Logged into Mead Tools")
-                self.mdata["LoginType"] = "MeadTools"
             else:
                 self.update_status("Failed to Login to Mead Tools")
                 self.mdata["LoginType"] = "None"
@@ -205,12 +205,12 @@ class PillWindow(QtWidgets.QMainWindow):
             )
             if not result:
                 return
-            self.tool.data["MTDetails"]["Google"] = self.lablineE_googleAuth.text
+            self.mdata["LoginType"] = "Google"
+            self.mdata["Google"] = self.lablineE_googleAuth.text
             self.tool.mtools.save_data()
             success = self.tool.mtools.google_auth()
             if success:
                 self.update_status("Successfully Logged into Mead Tools with Google...")
-                self.mdata["LoginType"] = "Google"
 
             else:
                 self.mdata["LoginType"] = "None"

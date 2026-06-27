@@ -282,6 +282,7 @@ class MeadTools(object):
 
         if self.ui:
             self.ui.logged_in(self.logged_in)
+        return self.logged_in
 
     def refresh_login(self) -> bool:
         """Refresh the access token for the given user
