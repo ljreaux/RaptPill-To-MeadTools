@@ -355,9 +355,8 @@ class RaptScanWorker(QtCore.QThread):
     scan_finished = QtCore.Signal(str)
     scan_failed = QtCore.Signal(str)
 
-    def __init__(self, duration: int = 30, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent=parent)
-        self.duration = duration
 
     def run(self):
         loop = asyncio.new_event_loop()
@@ -371,9 +370,7 @@ class RaptScanWorker(QtCore.QThread):
 
             try:
                 async with PillToMeadTools.BleakScanner(callback):
-                    for _ in range(self.duration):
-                        if self.isInterruptionRequested():
-                            break
+                    while not self.isInterruptionRequested():
                         await asyncio.sleep(1)
                 self.scan_finished.emit("Scan finished")
             except Exception as exc:
@@ -386,9 +383,8 @@ class RaptScanWorker(QtCore.QThread):
 
 
 class RaptPillScanDialog(QtWidgets.QDialog):
-    def __init__(self, parent=None, duration: int = 30):
+    def __init__(self, parent=None):
         super().__init__(parent=parent)
-        self.duration = duration
         self.worker = None
         self.devices = {}
         self.selected_device = None
@@ -438,8 +434,8 @@ class RaptPillScanDialog(QtWidgets.QDialog):
         self.selected_device = None
         self.table.setRowCount(0)
         self.select_button.setEnabled(False)
-        self.status_label.setText(f"Scanning for RAPT Pills for {self.duration} seconds...")
-        self.worker = RaptScanWorker(self.duration, self)
+        self.status_label.setText("Scanning for RAPT Pills...")
+        self.worker = RaptScanWorker(self)
         self.worker.device_found.connect(self.upsert_device)
         self.worker.scan_finished.connect(self.scan_finished)
         self.worker.scan_failed.connect(self.scan_failed)
@@ -448,7 +444,7 @@ class RaptPillScanDialog(QtWidgets.QDialog):
     def stop_scan(self):
         if self.worker and self.worker.isRunning():
             self.worker.requestInterruption()
-            self.worker.wait(3000)
+            self.worker.wait()
         self.worker = None
 
     def scan_finished(self, message: str):
@@ -486,11 +482,13 @@ class RaptPillScanDialog(QtWidgets.QDialog):
             device.get("firmware_version", ""),
         ]
         for column, value in enumerate(values):
-            item = self.table.item(row, column) or QtWidgets.QTableWidgetItem()
+            item = self.table.item(row, column)
+            if item is None:
+                item = QtWidgets.QTableWidgetItem()
+                self.table.setItem(row, column, item)
             item.setText(str(value))
             if column == 0:
                 item.setData(QtCore.Qt.UserRole, key)
-            self.table.setItem(row, column, item)
         self.table.resizeColumnsToContents()
 
     def find_row(self, key: str):
